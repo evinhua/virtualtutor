@@ -37,6 +37,23 @@ assistant_speaking = threading.Event()  # set while TTS is playing
 interrupt_event = threading.Event()     # set on barge-in to abort LLM + TTS
 synth_busy = threading.Event()          # set while TTS synthesis is in flight
 
+# UI events for the optional web frontend (see server.py). Bounded so a session
+# running without a listener cannot grow without limit; oldest events are dropped.
+event_q: "queue.Queue[dict]" = queue.Queue(maxsize=512)
+
+
+def emit(kind: str, **data):
+    """Publish a UI event, discarding the oldest if nobody is draining the queue."""
+    event = {"type": kind, **data}
+    try:
+        event_q.put_nowait(event)
+    except queue.Full:
+        try:
+            event_q.get_nowait()
+            event_q.put_nowait(event)
+        except (queue.Empty, queue.Full):
+            pass
+
 conversation = [{"role": "system", "content": config.SYSTEM_PROMPT}]
 # History is trimmed in blocks rather than every turn. Dropping the oldest
 # message each turn changes the token prefix after the system prompt, which
@@ -83,6 +100,9 @@ def vad_worker():
     silence = 0
     speech_run = 0
     was_assistant_speaking = False
+    # Emit a mic level roughly 10x/second rather than once per 512-sample frame.
+    level_every = max(1, int(config.SAMPLE_RATE / config.FRAME_SIZE / 10))
+    level_ticks = 0
 
     def flush_input():
         """Drop any buffered mic frames (e.g. echo picked up during playback)."""
@@ -118,6 +138,7 @@ def vad_worker():
                         interrupt_event.set()
                         drain_queue(speak_q)
                         drain_queue(audio_q)
+                        emit("interrupted")
                         speech_run = 0
                 else:
                     speech_run = 0
@@ -128,9 +149,16 @@ def vad_worker():
         prob = vad(torch.from_numpy(frame), config.SAMPLE_RATE).item()
         is_speech = prob >= config.VAD_THRESHOLD
 
+        # Feed the UI a coarse input level (~10 Hz) to drive the background waves.
+        level_ticks += 1
+        if level_ticks >= level_every:
+            level_ticks = 0
+            emit("level", value=round(float(np.sqrt(np.mean(np.square(frame)))), 4))
+
         if is_speech:
             if not speaking:
                 print("\n[VAD] speech detected, listening ...")
+                emit("state", state="hearing")
                 speaking = True
                 # seed with pre-roll so the onset (first word) is not clipped
                 buffer = list(preroll)
@@ -146,6 +174,9 @@ def vad_worker():
                 if len(buffer) >= min_speech:
                     audio = np.concatenate(buffer).astype(np.float32)
                     utterance_q.put(audio)
+                    emit("state", state="thinking")
+                else:
+                    emit("state", state="listening")
                 buffer = []
                 preroll.clear()
                 vad.reset_states()
@@ -221,6 +252,8 @@ def stream_llm(prompt: str):
         resp = requests.post(config.LLAMA_SERVER_URL, json=payload, stream=True, timeout=120)
     except requests.RequestException as e:
         print(f"\n[LLM] cannot reach llama-server: {e}")
+        emit("error", text="Cannot reach the language model server. "
+                           "Start it with ./scripts/start_server.sh")
         conversation.pop()  # roll back the user turn
         return
 
@@ -241,6 +274,7 @@ def stream_llm(prompt: str):
         if not token:
             continue
         print(token, end="", flush=True)
+        emit("assistant_delta", text=token)
         sentence += token
         full_reply += token
         m = SENTENCE_END.search(sentence)
@@ -253,6 +287,7 @@ def stream_llm(prompt: str):
         yield sentence.strip()
     if full_reply.strip():
         conversation.append({"role": "assistant", "content": full_reply.strip()})
+    emit("assistant_done")
     trim_history()
 
 
@@ -282,8 +317,10 @@ def brain_worker():
         interrupt_event.clear()
         text = transcribe(audio)
         if not text:
+            emit("state", state="listening")
             continue
         print(f"\n[You]: {text}")
+        emit("user", text=text)
         for sentence in stream_llm(text):
             if interrupt_event.is_set():
                 break
@@ -371,6 +408,7 @@ def speak_worker(tts: KokoroTTS):
                 continue
 
             assistant_speaking.set()
+            emit("state", state="speaking")
             play_interruptible(out, audio)
 
             if interrupt_event.is_set():
@@ -380,6 +418,7 @@ def speak_worker(tts: KokoroTTS):
                 drain_queue(audio_q)
                 out.abort()
                 assistant_speaking.clear()
+                emit("state", state="listening")
                 continue
 
             # Only release the mic once nothing else is coming AND the audio
@@ -390,6 +429,7 @@ def speak_worker(tts: KokoroTTS):
                 time.sleep(out.latency)
                 if not more_speech_coming():
                     assistant_speaking.clear()
+                    emit("state", state="listening")
     finally:
         out.close(ignore_errors=True)
 
@@ -437,37 +477,105 @@ def select_persona() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Pipeline lifecycle (used by both the CLI and the web server)
+# ---------------------------------------------------------------------------
+_threads: list[threading.Thread] = []
+_input_stream = None
+_tts: "KokoroTTS | None" = None
+_lifecycle_lock = threading.Lock()
+
+
+def is_running() -> bool:
+    return any(t.is_alive() for t in _threads)
+
+
+def load_tts() -> KokoroTTS:
+    """Load Kokoro once and reuse it, so restarting does not re-pay model load."""
+    global _tts
+    if _tts is None:
+        _tts = KokoroTTS()
+    return _tts
+
+
+def start_pipeline(persona_key: str = config.DEFAULT_PERSONA, reset_history: bool = True):
+    """Start mic capture and all worker threads. No-op if already running."""
+    global _threads, _input_stream
+    with _lifecycle_lock:
+        if is_running():
+            return
+        # Fresh state for a new session.
+        stop_event.clear()
+        interrupt_event.clear()
+        assistant_speaking.clear()
+        synth_busy.clear()
+        for q in (raw_q, utterance_q, speak_q, audio_q):
+            drain_queue(q)
+
+        conversation[0]["content"] = config.build_system_prompt(persona_key)
+        if reset_history:
+            del conversation[1:]
+
+        tts = load_tts()
+        _threads = [
+            threading.Thread(target=vad_worker, name="vad", daemon=True),
+            threading.Thread(target=brain_worker, name="brain", daemon=True),
+            threading.Thread(target=synth_worker, args=(tts,), name="synth", daemon=True),
+            threading.Thread(target=speak_worker, args=(tts,), name="speak", daemon=True),
+        ]
+        for t in _threads:
+            t.start()
+
+        _input_stream = sd.InputStream(
+            samplerate=config.SAMPLE_RATE, channels=config.CHANNELS,
+            dtype="float32", blocksize=config.FRAME_SIZE, callback=audio_callback,
+        )
+        _input_stream.start()
+        emit("state", state="listening")
+
+
+def stop_pipeline():
+    """Stop mic capture and shut the worker threads down."""
+    global _threads, _input_stream
+    with _lifecycle_lock:
+        stop_event.set()
+        if _input_stream is not None:
+            try:
+                _input_stream.stop()
+                _input_stream.close()
+            except Exception as e:
+                print(f"[audio] input stream close: {e}")
+            _input_stream = None
+        for t in _threads:
+            t.join(timeout=3)
+        _threads = []
+        assistant_speaking.clear()
+        for q in (raw_q, utterance_q, speak_q, audio_q):
+            drain_queue(q)
+        emit("state", state="idle")
+
+
+# ---------------------------------------------------------------------------
+# Main (CLI)
 # ---------------------------------------------------------------------------
 def main():
     persona_key = select_persona()
     persona = config.PERSONAS[persona_key]
-    # Apply the chosen persona to the conversation's system prompt.
-    conversation[0]["content"] = config.build_system_prompt(persona_key)
 
     print(f"\nInitializing VirtualTutor as {persona['name']} ...")
-    tts = KokoroTTS()
-
-    threads = [
-        threading.Thread(target=vad_worker, name="vad", daemon=True),
-        threading.Thread(target=brain_worker, name="brain", daemon=True),
-        threading.Thread(target=synth_worker, args=(tts,), name="synth", daemon=True),
-        threading.Thread(target=speak_worker, args=(tts,), name="speak", daemon=True),
-    ]
-    for t in threads:
-        t.start()
+    start_pipeline(persona_key)
 
     print("\n\U0001F393  VirtualTutor is listening. Speak into your mic. Press Ctrl+C to quit.\n")
     try:
-        with sd.InputStream(samplerate=config.SAMPLE_RATE, channels=config.CHANNELS,
-                            dtype="float32", blocksize=config.FRAME_SIZE,
-                            callback=audio_callback):
-            while not stop_event.is_set():
-                sd.sleep(200)
+        while not stop_event.is_set():
+            sd.sleep(200)
     except KeyboardInterrupt:
         print("\nShutting down ...")
     finally:
-        stop_event.set()
+        stop_pipeline()
+
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":

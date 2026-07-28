@@ -45,6 +45,19 @@ brew install portaudio ffmpeg espeak-ng llama.cpp
 
 ## Run
 
+Everything with one command (recommended):
+
+```bash
+./scripts/start_all.sh          # then open http://127.0.0.1:8800
+```
+
+This starts the LLM backend, waits for the model to load, then starts the web
+frontend. **Ctrl+C stops both.** If an LLM server is already running on the port
+it is reused and left running on exit. The LLM's verbose log goes to
+`$TMPDIR/virtualtutor-llm.log`; transcripts stay in the foreground.
+
+### Or run the pieces separately
+
 Open two terminals:
 
 ```bash
@@ -72,6 +85,34 @@ by number, or press Enter for the default. You can skip the menu by presetting
 | `explorer` | The Curious Explorer | Treats every question like a fun mystery |
 
 Quit with `Ctrl+C`.
+
+## Web UI
+
+A local web frontend is available as an alternative to the terminal: one
+start/stop button, a live transcript, and an animated background whose colours
+and wave shapes follow the conversation state and your voice level.
+
+```bash
+# Terminal 1 — LLM server
+./scripts/start_server.sh
+
+# Terminal 2 — web frontend
+./scripts/start_web.sh          # then open http://127.0.0.1:8800
+```
+
+Audio stays on this machine: the microphone and speakers are driven by the same
+Python pipeline as the CLI, and the browser is only the control surface and
+transcript view. The server is built on the Python standard library
+(`ThreadingHTTPServer` + Server-Sent Events), so it adds no dependencies.
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `VT_WEB_HOST` | `127.0.0.1` | web UI bind address |
+| `VT_WEB_PORT` | `8800` | web UI port |
+
+**Security:** like the LLM server, the web UI binds to `127.0.0.1` and has **no
+authentication**. Anyone who can reach it can start your microphone, so do not
+bind it to `0.0.0.0` or expose it to a network without adding access control.
 
 ## Verify (no microphone needed)
 
@@ -120,11 +161,19 @@ virtualtutor/
 ├── samples/                # verification wav output
 ├── scripts/
 │   ├── download_model.sh
+│   ├── start_all.sh        # backend + frontend, Ctrl+C stops both
 │   ├── start_server.sh
-│   └── start_agent.sh
+│   ├── start_agent.sh
+│   └── start_web.sh
+├── specs/                  # mission, roadmap, tech stack
+├── web/                    # web frontend (static, no build step)
+│   ├── index.html
+│   ├── styles.css
+│   └── app.js
 └── src/
     ├── config.py
     ├── tts.py
     ├── voice_agent.py
+    ├── server.py           # local web server (stdlib only)
     └── verify.py
 ```

@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VirtualTutor</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<!-- Decorative animated waves; hidden from assistive tech. -->
+<canvas id="waves" aria-hidden="true"></canvas>
+
+<main class="shell">
+  <header class="masthead">
+    <h1>VirtualTutor</h1>
+    <p class="tagline">On-device voice tutoring. Speak naturally &mdash; pause to get a reply.</p>
+  </header>
+
+  <section class="panel" aria-label="Conversation">
+    <div class="panel-head">
+      <label class="persona">
+        <span class="persona-label">Persona</span>
+        <select id="persona" aria-label="Tutor persona"></select>
+      </label>
+      <p class="status">
+        <span id="status-dot" class="dot" aria-hidden="true"></span>
+        <span id="status-text" role="status" aria-live="polite">Idle</span>
+      </p>
+    </div>
+
+    <div id="chat" class="chat" role="log" aria-live="polite" aria-label="Chat transcript" tabindex="0">
+      <p class="empty" id="empty-state">Press Start, then say something to begin.</p>
+    </div>
+  </section>
+
+  <button id="toggle" class="toggle" type="button" aria-pressed="false">
+    <span class="toggle-icon" aria-hidden="true"></span>
+    <span id="toggle-label" class="toggle-label">Start</span>
+  </button>
+
+  <p id="error" class="error" role="alert" hidden></p>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>
