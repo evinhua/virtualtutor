@@ -1,0 +1,10 @@
+# VirtualTutor - Python dependencies (Apple Silicon, Python 3.11)
+numpy
+requests
+sounddevice        # microphone capture + speaker playback (needs portaudio)
+soundfile          # wav read/write for verification
+torch              # backend for Silero VAD
+silero-vad         # voice activity detection (v5)
+mlx-whisper        # Metal-accelerated speech-to-text
+mlx-audio          # Metal-accelerated Kokoro text-to-speech
+misaki[en]         # G2P text processing required by Kokoro

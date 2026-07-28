@@ -1,0 +1,5 @@
+.venv/
+models/*.gguf
+samples/*.wav
+__pycache__/
+*.pyc
