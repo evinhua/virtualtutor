@@ -109,9 +109,25 @@ DEFAULT_PERSONA = "tutor"
 
 
 def build_system_prompt(persona_key: str = DEFAULT_PERSONA) -> str:
-    """Combine the base tutoring rules with a persona's personality style."""
+    """Combine the base tutoring rules with a persona's personality style.
+
+    The persona's name goes in the prompt too, so the tutor can answer "who are
+    you?" in character instead of falling back on a generic self-description.
+    """
     persona = PERSONAS.get(persona_key, PERSONAS[DEFAULT_PERSONA])
-    return f"{BASE_SYSTEM_PROMPT} {persona['style']}"
+    return (
+        f"{BASE_SYSTEM_PROMPT} "
+        f"You are currently in the persona of {persona['name']}. {persona['style']} "
+        f"If the student asks who or what you are, asks you to introduce yourself, "
+        f"or asks which persona or personality you have, tell them you are "
+        f"VirtualTutor speaking as {persona['name']}, and answer in that "
+        f"personality rather than dropping out of character."
+    )
+
+
+def persona_name(persona_key: str = DEFAULT_PERSONA) -> str:
+    """Display name of a persona, falling back to the default."""
+    return PERSONAS.get(persona_key, PERSONAS[DEFAULT_PERSONA])["name"]
 
 
 # Optional preselection via env var; falls back to the default persona.
@@ -132,6 +148,9 @@ TTS_MODEL = os.environ.get("VT_TTS_MODEL", "prince-canuma/Kokoro-82M")
 TTS_VOICE = os.environ.get("VT_TTS_VOICE", "af_heart")
 TTS_SPEED = 1.0
 TTS_SAMPLE_RATE = 24000      # Kokoro outputs 24 kHz audio
+# Kokoro language pipeline: 'a' = American English, 'b' = British English.
+# Also selects which misaki G2P is used, which the viseme timeline depends on.
+TTS_LANG_CODE = os.environ.get("VT_TTS_LANG", "a")
 
 # ---------------------------------------------------------------------------
 # Behaviour

@@ -66,6 +66,8 @@ function setStatus(state) {
   el.statusText.textContent = STATUS_TEXT[state] || state;
   el.statusDot.className = `dot ${state}`;
   waves.setState(state);
+  avatar.setState(state);
+  if (state === "idle" || state === "listening") avatar.silence();
 }
 
 function showError(message) {
@@ -82,7 +84,9 @@ function setRunning(next) {
   running = next;
   el.toggle.setAttribute("aria-pressed", String(running));
   el.toggleLabel.textContent = running ? "Stop" : "Start";
-  el.persona.disabled = running;
+  // The persona stays switchable while running: /api/persona rewrites the
+  // system prompt in place, so the next reply is in the new personality.
+  el.persona.disabled = false;
 }
 
 async function post(path, body) {
@@ -97,6 +101,18 @@ async function post(path, body) {
   }
   return data;
 }
+
+/* Persona can be changed at any time; while a session is live the server
+   rewrites the system prompt so the next reply changes personality. */
+el.persona.addEventListener("change", async () => {
+  clearError();
+  try {
+    const { persona_name: name } = await post("/api/persona", { persona: el.persona.value });
+    addMessage("system", `Persona: ${name}`);
+  } catch (err) {
+    showError(err.message);
+  }
+});
 
 el.toggle.addEventListener("click", async () => {
   if (busy) return;
@@ -154,8 +170,12 @@ function connectEvents() {
       case "assistant_done":
         finishTutorTurn();
         break;
+      case "visemes":
+        avatar.speak(event.start_in_ms, event.timeline);
+        break;
       case "interrupted":
         finishTutorTurn();
+        avatar.silence();
         break;
       case "level":
         waves.setLevel(event.value);
@@ -285,6 +305,287 @@ const waves = (() => {
   };
 })();
 
+/* --- avatar --------------------------------------------------------------
+   Draws a face whose mouth follows the viseme timeline produced by Kokoro.
+   The server sends [[start_ms, viseme], ...] plus start_in_ms, the delay until
+   the audio is actually audible (PortAudio buffer + anything still playing),
+   so the mouth lines up with what you hear even though audio plays server-side.
+
+   If web/avatar/manifest.json exists (built by tools/build_photo_avatar.py) a
+   photo avatar is used: one base face plus a small mouth patch per viseme,
+   feathered in through an elliptical mask. Shipping patches instead of 14 whole
+   faces keeps the download at ~170 KB rather than ~2.3 MB, and because
+   everything outside the mouth comes from the base image the eyes never blink
+   or glance around when the mouth changes. Without the manifest it falls back
+   to the vector face, so the UI works with no assets built.
+------------------------------------------------------------------------- */
+const avatar = (() => {
+  const canvas = document.getElementById("avatar");
+  const ctx = canvas.getContext("2d");
+  const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  // Mouth geometry per viseme, as fractions of head size.
+  // w = width, h = opening height, r = roundness (0 = wide slit, 1 = circle).
+  const MOUTH = {
+    sil: { w: 0.34, h: 0.03, r: 0.50 },
+    PP:  { w: 0.30, h: 0.02, r: 0.50 },
+    FF:  { w: 0.36, h: 0.07, r: 0.30 },
+    TH:  { w: 0.34, h: 0.13, r: 0.30 },
+    DD:  { w: 0.36, h: 0.15, r: 0.30 },
+    SS:  { w: 0.32, h: 0.08, r: 0.25 },
+    CH:  { w: 0.28, h: 0.17, r: 0.60 },
+    KK:  { w: 0.36, h: 0.18, r: 0.35 },
+    RR:  { w: 0.30, h: 0.15, r: 0.55 },
+    aa:  { w: 0.42, h: 0.36, r: 0.40 },
+    E:   { w: 0.40, h: 0.22, r: 0.35 },
+    ih:  { w: 0.40, h: 0.14, r: 0.30 },
+    oh:  { w: 0.30, h: 0.30, r: 0.75 },
+    ou:  { w: 0.24, h: 0.22, r: 0.85 },
+  };
+
+  let timeline = [];      // [[start_ms, viseme], ...]
+  let startAt = 0;        // performance.now() when timeline position 0 is heard
+  let cursor = 0;         // index into timeline, advanced monotonically
+  let shape = { ...MOUTH.sil };
+  let state = "idle";
+  let blinkAt = performance.now() + 2500;
+  let blink = 0;          // 0 = open, 1 = closed
+  let size = 168, dpr = 1;
+
+  // --- photo mode ---------------------------------------------------------
+  const CROSSFADE_MS = 70;   // a viseme lasts >= 25 ms; ease, do not snap
+  let photo = null;          // { base, patches, patchBox, scale } once loaded
+  let current = "sil";       // viseme currently being shown
+  let previous = "sil";      // viseme being faded out
+  let changedAt = 0;
+
+  /** Alpha mask matching build_photo_avatar.py's mouth_mask, in patch space. */
+  function maskedPatch(image, manifest) {
+    const p = manifest.patch, m = manifest.mouth;
+    const out = document.createElement("canvas");
+    out.width = p.w;
+    out.height = p.h;
+    const c = out.getContext("2d");
+    c.drawImage(image, 0, 0, p.w, p.h);
+
+    const alpha = c.createImageData(p.w, p.h);
+    const ramp = m.feather / Math.min(m.rx, m.ry);
+    for (let y = 0; y < p.h; y++) {
+      for (let x = 0; x < p.w; x++) {
+        const nx = (x + p.x - m.cx) / m.rx;
+        const ny = (y + p.y - m.cy) / m.ry;
+        const d = Math.sqrt(nx * nx + ny * ny);
+        const t = Math.min(1, Math.max(0, (1 + ramp - d) / ramp));
+        const i = (y * p.w + x) * 4 + 3;
+        alpha.data[i] = Math.round(255 * t * t * (3 - 2 * t));  // smoothstep
+      }
+    }
+    const maskCanvas = document.createElement("canvas");
+    maskCanvas.width = p.w;
+    maskCanvas.height = p.h;
+    maskCanvas.getContext("2d").putImageData(alpha, 0, 0);
+    c.globalCompositeOperation = "destination-in";
+    c.drawImage(maskCanvas, 0, 0);
+    return out;
+  }
+
+  function loadImage(src) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error(`cannot load ${src}`));
+      img.src = src;
+    });
+  }
+
+  /** Load the photo sprite set; silently stay on the vector face if absent. */
+  async function loadPhoto() {
+    let manifest;
+    try {
+      const res = await fetch("avatar/manifest.json", { cache: "no-store" });
+      if (!res.ok) return;
+      manifest = await res.json();
+      if (manifest.mode !== "patch") return;
+    } catch {
+      return;
+    }
+    try {
+      const base = await loadImage(`avatar/${manifest.base}`);
+      const patches = {};
+      await Promise.all(Object.entries(manifest.images).map(async ([viseme, file]) => {
+        patches[viseme] = maskedPatch(await loadImage(`avatar/${file}`), manifest);
+      }));
+      photo = { base, patches, manifest };
+      canvas.removeAttribute("aria-hidden");
+      canvas.setAttribute("role", "img");
+      canvas.setAttribute("aria-label", "Tutor avatar");
+    } catch (e) {
+      photo = null;      // a missing sprite must not break the whole UI
+    }
+  }
+
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    size = canvas.clientWidth || 168;
+    canvas.width = Math.round(size * dpr);
+    canvas.height = Math.round(size * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  function lerp(a, b, t) { return a + (b - a) * t; }
+
+  /** Viseme that should be visible at `now`, following the timeline. */
+  function visemeAt(now) {
+    if (!timeline.length) return "sil";
+    const t = now - startAt;
+    if (t < 0) return "sil";                            // audio not audible yet
+    // Advance the cursor to the span covering t (timeline is sorted).
+    while (cursor + 1 < timeline.length && timeline[cursor + 1][0] <= t) cursor++;
+    while (cursor > 0 && timeline[cursor][0] > t) cursor--;
+    if (t > timeline[timeline.length - 1][0]) {          // utterance finished
+      timeline = [];
+      return "sil";
+    }
+    return timeline[cursor][1] || "sil";
+  }
+
+  function targetShape(now) {
+    return MOUTH[visemeAt(now)] || MOUTH.sil;
+  }
+
+  /** Photo avatar: base face + the current mouth patch, cross-faded. */
+  function drawPhoto(now) {
+    const viseme = visemeAt(now);
+    if (viseme !== current) {
+      previous = current;
+      current = viseme;
+      changedAt = now;
+    }
+    const p = photo.manifest.patch;
+    const k = size / photo.manifest.size;        // exported px -> CSS px
+    const px = p.x * k, py = p.y * k, pw = p.w * k, ph = p.h * k;
+    const fade = reduceMotion ? 1
+      : Math.min(1, (now - changedAt) / CROSSFADE_MS);
+
+    ctx.clearRect(0, 0, size, size);
+    ctx.drawImage(photo.base, 0, 0, size, size);
+    const before = photo.patches[previous];
+    const after = photo.patches[current];
+    if (before && fade < 1) {
+      ctx.globalAlpha = 1;
+      ctx.drawImage(before, px, py, pw, ph);
+    }
+    if (after) {
+      ctx.globalAlpha = before ? fade : 1;
+      ctx.drawImage(after, px, py, pw, ph);
+      ctx.globalAlpha = 1;
+    }
+
+    // Thin ring tinted by pipeline state: the only chrome the photo needs.
+    const hue = stateHue();
+    ctx.strokeStyle = `hsl(${hue} 78% 62% / ${state === "idle" ? 0.35 : 0.75})`;
+    ctx.lineWidth = Math.max(2, size * 0.018);
+    const inset = ctx.lineWidth / 2;
+    const radius = size * 0.14;
+    ctx.beginPath();
+    if (ctx.roundRect) {
+      ctx.roundRect(inset, inset, size - 2 * inset, size - 2 * inset, radius);
+    } else {
+      ctx.rect(inset, inset, size - 2 * inset, size - 2 * inset);   // older Safari
+    }
+    ctx.stroke();
+  }
+
+  function stateHue() {
+    return state === "speaking" ? 268 : state === "thinking" ? 38
+      : state === "hearing" ? 214 : state === "listening" ? 168 : 218;
+  }
+
+  function draw(now) {
+    if (photo) {
+      drawPhoto(now);
+      requestAnimationFrame(draw);
+      return;
+    }
+    const tgt = targetShape(now);
+    // Ease toward the target so 25 ms phonemes do not look like flicker.
+    const k = reduceMotion ? 1 : 0.34;
+    shape.w = lerp(shape.w, tgt.w, k);
+    shape.h = lerp(shape.h, tgt.h, k);
+    shape.r = lerp(shape.r, tgt.r, k);
+
+    // Blink on an irregular schedule; suppressed under reduced motion.
+    if (!reduceMotion) {
+      if (now > blinkAt) {
+        blink = Math.min(1, blink + 0.25);
+        if (blink >= 1) { blinkAt = now + 1800 + Math.random() * 3500; }
+      } else {
+        blink = Math.max(0, blink - 0.2);
+      }
+    }
+
+    const c = size / 2;
+    // Gentle breathing bob while active.
+    const bob = reduceMotion || state === "idle" ? 0 : Math.sin(now / 900) * size * 0.008;
+    ctx.clearRect(0, 0, size, size);
+
+    // Head.
+    const head = size * 0.40;
+    const g = ctx.createLinearGradient(0, c - head, 0, c + head);
+    const hue = stateHue();
+    g.addColorStop(0, `hsl(${hue} 72% 74%)`);
+    g.addColorStop(1, `hsl(${hue + 18} 66% 58%)`);
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.ellipse(c, c + bob, head * 0.86, head, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Eyes.
+    const eyeY = c + bob - head * 0.18;
+    const eyeDx = head * 0.34;
+    const eyeR = head * 0.10;
+    ctx.fillStyle = "#12203a";
+    for (const dx of [-eyeDx, eyeDx]) {
+      ctx.beginPath();
+      ctx.ellipse(c + dx, eyeY, eyeR, eyeR * (1 - 0.92 * blink), 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Mouth: an ellipse whose height and roundness come from the viseme.
+    const mw = head * shape.w;
+    const mh = Math.max(size * 0.006, head * shape.h);
+    const my = c + bob + head * 0.34;
+    ctx.fillStyle = "#2a1420";
+    ctx.beginPath();
+    ctx.ellipse(c, my, mw / 2, mh / 2 + mw * 0.04 * shape.r, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // Inner highlight suggests depth when the mouth is open.
+    if (shape.h > 0.10) {
+      ctx.fillStyle = "rgba(255,255,255,0.14)";
+      ctx.beginPath();
+      ctx.ellipse(c, my + mh * 0.16, mw * 0.30, mh * 0.22, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    requestAnimationFrame(draw);
+  }
+
+  window.addEventListener("resize", resize);
+  resize();
+  loadPhoto();
+  requestAnimationFrame(draw);
+
+  return {
+    setState(next) { state = next; },
+    speak(startInMs, wire) {
+      timeline = Array.isArray(wire) ? wire : [];
+      cursor = 0;
+      startAt = performance.now() + (Number(startInMs) || 0);
+    },
+    silence() { timeline = []; cursor = 0; },
+  };
+})();
+
 /* --- boot -------------------------------------------------------------- */
 async function init() {
   try {
@@ -294,10 +595,12 @@ async function init() {
       opt.value = p.key;
       opt.textContent = p.name;
       opt.title = p.blurb;
-      if (p.key === fallback) opt.selected = true;
       el.persona.appendChild(opt);
     }
-    const { running: live } = await (await fetch("/api/status")).json();
+    // Show the persona actually in force, not the config default, so a reload
+    // mid-session does not misreport who the tutor currently is.
+    const { running: live, persona } = await (await fetch("/api/status")).json();
+    el.persona.value = persona || fallback;
     setRunning(live);
     setStatus(live ? "listening" : "idle");
   } catch {

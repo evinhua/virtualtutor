@@ -26,7 +26,10 @@ Make the existing experience reliable and easy to adopt.
 - Structured logging (levels, quiet/verbose modes) replacing ad-hoc prints.
 - Graceful startup/shutdown and clear error messages when llama-server is down.
 - Automated tests for the STT hallucination filters and sentence-splitting.
+  *(Delivered: `tests/` runs 99 model-free unit tests in under a second, also
+  covering the viseme timeline, history trimming and persona prompts.)*
 - A single launcher that starts the LLM server and agent together.
+  *(Delivered: `scripts/start_all.sh`.)*
 - Device selection / listing for input and output audio devices.
 - Documented troubleshooting guide (mic permissions, portaudio, echo).
 
@@ -39,7 +42,8 @@ Improve the tutoring experience itself.
 - Persistent conversation memory across sessions (save/restore history).
 - Configurable tutor personas / subjects via prompt presets.
   *(Personas delivered: startup menu + `VT_PERSONA` env var — tutor, jester,
-  cheerleader, explorer.)*
+  cheerleader, explorer. Switchable mid-session from the web UI, and the tutor
+  identifies itself by persona when asked.)*
 - Smarter history management (token-aware trimming, summarization of old turns).
 - Interruption-aware context so barge-in edits the ongoing turn cleanly.
 - Latency instrumentation (per-stage timing) surfaced for tuning.

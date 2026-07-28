@@ -6,9 +6,10 @@ keeps its offline, no-extra-dependency property.
 
   GET  /                -> the UI
   GET  /api/personas    -> available tutor personas
-  GET  /api/status      -> whether the pipeline is running
+  GET  /api/status      -> whether the pipeline is running, and which persona
   GET  /api/events      -> SSE stream of pipeline events
   POST /api/start       -> start listening   (body: {"persona": "tutor"})
+  POST /api/persona     -> switch persona    (body: {"persona": "jester"})
   POST /api/stop        -> stop listening
 
 Audio stays on this machine: the microphone and speakers are driven by the
@@ -137,7 +138,11 @@ class Handler(BaseHTTPRequestHandler):
                 ],
             })
         elif route == "/api/status":
-            self._send_json({"running": voice_agent.is_running()})
+            self._send_json({
+                "running": voice_agent.is_running(),
+                "persona": voice_agent.active_persona,
+                "persona_name": config.persona_name(voice_agent.active_persona),
+            })
         elif route == "/api/events":
             self._stream_events()
         else:
@@ -162,6 +167,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"ok": False, "error": str(e)}, 500)
                 return
             self._send_json({"ok": True, "running": True, "persona": persona})
+        elif route == "/api/persona":
+            # Switching mid-session: rewrite the system prompt in place so the
+            # next reply is in the new personality, running or not.
+            persona = voice_agent.set_persona(
+                str(self._read_json().get("persona", config.DEFAULT_PERSONA)))
+            self._send_json({"ok": True, "persona": persona,
+                             "persona_name": config.persona_name(persona)})
         elif route == "/api/stop":
             try:
                 voice_agent.stop_pipeline()

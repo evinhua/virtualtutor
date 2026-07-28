@@ -1,5 +1,9 @@
 .venv/
 models/*.gguf
 samples/*.wav
+samples/*.mp4
+# generated photo sprites (tools/build_photo_avatar.py)
+web/avatar/
 __pycache__/
 *.pyc
+.pytest_cache/

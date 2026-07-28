@@ -22,6 +22,7 @@ import torch
 from silero_vad import load_silero_vad
 
 import config
+import visemes
 from tts import KokoroTTS
 
 # ---------------------------------------------------------------------------
@@ -30,7 +31,7 @@ from tts import KokoroTTS
 raw_q: "queue.Queue[np.ndarray]" = queue.Queue()      # 512-sample mic frames
 utterance_q: "queue.Queue[np.ndarray]" = queue.Queue()  # complete user utterances
 speak_q: "queue.Queue[str]" = queue.Queue()             # sentences to speak aloud
-audio_q: "queue.Queue[np.ndarray]" = queue.Queue()      # synthesized audio ready to play
+audio_q: "queue.Queue[tuple]" = queue.Queue()            # (audio, viseme timeline) ready to play
 
 stop_event = threading.Event()          # global shutdown
 assistant_speaking = threading.Event()  # set while TTS is playing
@@ -55,6 +56,9 @@ def emit(kind: str, **data):
             pass
 
 conversation = [{"role": "system", "content": config.SYSTEM_PROMPT}]
+# Persona currently in force. Kept here (not just in the system prompt) so the
+# CLI, the web UI and the transcript can all label replies correctly.
+active_persona = config.PERSONA
 # History is trimmed in blocks rather than every turn. Dropping the oldest
 # message each turn changes the token prefix after the system prompt, which
 # invalidates llama.cpp's KV cache and forces a full re-prefill of the whole
@@ -66,6 +70,36 @@ HISTORY_HIGH_WATER = 24  # messages after the system prompt before trimming
 HISTORY_LOW_WATER = 12   # messages kept after a trim
 
 SENTENCE_END = re.compile(r"[.!?;:]+[\s\"')\]]*\s|[\n]+")
+
+# ---------------------------------------------------------------------------
+# Session generation
+# ---------------------------------------------------------------------------
+# Workers are told which session they belong to and stop as soon as a new one
+# starts. Without this, a worker still finishing a reply when the user pressed
+# Stop could survive into the next session -- two speak_workers fighting over
+# the output device, and a stale system prompt (i.e. the old persona) in play.
+_generation = 0
+
+
+def session_active(gen: int) -> bool:
+    """True while `gen` is still the current session and no stop was requested."""
+    return not stop_event.is_set() and gen == _generation
+
+
+def set_persona(persona_key: str) -> str:
+    """Switch persona, in or out of a running session. Returns the key applied.
+
+    The system prompt is rewritten in place, so the next reply is in the new
+    personality; history is kept so the conversation still makes sense.
+    """
+    global active_persona
+    if persona_key not in config.PERSONAS:
+        persona_key = config.DEFAULT_PERSONA
+    active_persona = persona_key
+    conversation[0]["content"] = config.build_system_prompt(persona_key)
+    emit("persona", key=persona_key, name=config.persona_name(persona_key))
+    return persona_key
+
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +114,7 @@ def audio_callback(indata, frames, time_info, status):
 # ---------------------------------------------------------------------------
 # 2. Voice Activity Detection
 # ---------------------------------------------------------------------------
-def vad_worker():
+def vad_worker(gen: int):
     """Detect speech segments and enqueue complete utterances.
 
     While the assistant is speaking, detected speech triggers barge-in instead
@@ -109,7 +143,7 @@ def vad_worker():
         with raw_q.mutex:
             raw_q.queue.clear()
 
-    while not stop_event.is_set():
+    while session_active(gen):
         try:
             frame = raw_q.get(timeout=0.2)
         except queue.Empty:
@@ -185,6 +219,54 @@ def vad_worker():
 # ---------------------------------------------------------------------------
 # 3. STT + LLM (the "brain")
 # ---------------------------------------------------------------------------
+def utterance_rms(audio: np.ndarray) -> float:
+    """Root-mean-square level of an utterance (0.0 for an empty buffer)."""
+    if audio is None or audio.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(np.square(audio))))
+
+
+def has_real_speech(segments) -> bool:
+    """True if at least one Whisper segment looks like genuine speech.
+
+    Used to reject a WHOLE utterance that is entirely non-speech. Individual
+    mid-sentence segments are never dropped -- doing so previously lost words.
+    An empty segment list is inconclusive, so it counts as speech and the
+    phrase blocklist gets the final say.
+    """
+    segments = segments or []
+    if not segments:
+        return True
+    return any(
+        s.get("no_speech_prob", 0.0) <= config.STT_MAX_NO_SPEECH_PROB
+        and s.get("avg_logprob", 0.0) >= config.STT_MIN_AVG_LOGPROB
+        for s in segments
+    )
+
+
+def is_hallucination(text: str) -> bool:
+    """True if `text` is one of Whisper's stock filler phrases.
+
+    Compared after stripping punctuation and case, so "Thank you." and
+    "thank you" both match.
+    """
+    normalized = re.sub(r"[^\w\s]", "", text or "").strip().lower()
+    return normalized in config.STT_HALLUCINATION_PHRASES
+
+
+def next_sentence(buffer: str):
+    """Split the first complete sentence off `buffer`.
+
+    Returns (sentence, remainder); sentence is None while the buffer does not
+    yet hold a sentence end. Punctuation must be followed by whitespace or a
+    newline, so "3.14" and mid-word colons do not split the stream early.
+    """
+    m = SENTENCE_END.search(buffer)
+    if not m:
+        return None, buffer
+    return buffer[: m.end()].strip(), buffer[m.end():]
+
+
 def transcribe(audio: np.ndarray) -> str:
     """Transcribe an utterance, guarding against Whisper hallucinations.
 
@@ -195,7 +277,7 @@ def transcribe(audio: np.ndarray) -> str:
     import mlx_whisper
 
     # Layer 1: energy gate -- ignore near-silent buffers entirely.
-    rms = float(np.sqrt(np.mean(np.square(audio)))) if audio.size else 0.0
+    rms = utterance_rms(audio)
     if rms < config.STT_MIN_RMS:
         print(f"[STT] skipped near-silence (rms={rms:.4f})")
         return ""
@@ -212,24 +294,14 @@ def transcribe(audio: np.ndarray) -> str:
     )
 
     # Layer 2: trust Whisper's own scores, but only to reject a WHOLE utterance
-    # that is entirely non-speech. Never drop individual mid-sentence segments --
-    # that is what previously lost words. If at least one segment is real speech,
-    # keep the complete transcription.
-    segments = result.get("segments", []) or []
-    if segments:
-        any_speech = any(
-            s.get("no_speech_prob", 0.0) <= config.STT_MAX_NO_SPEECH_PROB
-            and s.get("avg_logprob", 0.0) >= config.STT_MIN_AVG_LOGPROB
-            for s in segments
-        )
-        if not any_speech:
-            print("[STT] rejected: entire utterance flagged non-speech/low-confidence")
-            return ""
+    # that is entirely non-speech (see has_real_speech).
+    if not has_real_speech(result.get("segments")):
+        print("[STT] rejected: entire utterance flagged non-speech/low-confidence")
+        return ""
     text = result.get("text", "").strip()
 
     # Layer 3: blocklist of known hallucinated fillers.
-    normalized = re.sub(r"[^\w\s]", "", text).strip().lower()
-    if normalized in config.STT_HALLUCINATION_PHRASES:
+    if is_hallucination(text):
         print(f"[STT] rejected hallucination: {text!r}")
         return ""
 
@@ -247,7 +319,7 @@ def stream_llm(prompt: str):
     }
     sentence = ""
     full_reply = ""
-    print("[Tutor]: ", end="", flush=True)
+    print(f"[{config.persona_name(active_persona)}]: ", end="", flush=True)
     try:
         resp = requests.post(config.LLAMA_SERVER_URL, json=payload, stream=True, timeout=120)
     except requests.RequestException as e:
@@ -258,7 +330,7 @@ def stream_llm(prompt: str):
         return
 
     for line in resp.iter_lines():
-        if interrupt_event.is_set():
+        if interrupt_event.is_set() or stop_event.is_set():
             resp.close()
             break
         if not line:
@@ -277,11 +349,9 @@ def stream_llm(prompt: str):
         emit("assistant_delta", text=token)
         sentence += token
         full_reply += token
-        m = SENTENCE_END.search(sentence)
-        if m:
-            complete, sentence = sentence[: m.end()], sentence[m.end():]
-            if complete.strip():
-                yield complete.strip()
+        complete, sentence = next_sentence(sentence)
+        if complete:
+            yield complete
     print()
     if sentence.strip() and not interrupt_event.is_set():
         yield sentence.strip()
@@ -307,8 +377,8 @@ def trim_history():
         del conversation[1:cut]
 
 
-def brain_worker():
-    while not stop_event.is_set():
+def brain_worker(gen: int):
+    while session_active(gen):
         try:
             audio = utterance_q.get(timeout=0.2)
         except queue.Empty:
@@ -316,13 +386,17 @@ def brain_worker():
 
         interrupt_event.clear()
         text = transcribe(audio)
+        # Transcription takes a second or two, in which the user may have
+        # pressed Stop or switched session; do not start a reply into the void.
+        if not session_active(gen):
+            return
         if not text:
             emit("state", state="listening")
             continue
         print(f"\n[You]: {text}")
         emit("user", text=text)
         for sentence in stream_llm(text):
-            if interrupt_event.is_set():
+            if interrupt_event.is_set() or not session_active(gen):
                 break
             speak_q.put(sentence)
 
@@ -355,15 +429,18 @@ def play_interruptible(out: sd.OutputStream, audio: np.ndarray):
         out.write(audio[i:i + block])
 
 
-def synth_worker(tts: KokoroTTS):
+def synth_worker(tts: KokoroTTS, gen: int):
     """Synthesize queued sentences into audio, ahead of playback.
 
     Runs in its own thread so synthesis of the next sentence overlaps playback
     of the current one. Kokoro synthesizes at RTF ~0.05, so a sentence is ready
     far sooner than it takes to speak the previous one and the inter-sentence
     gap disappears entirely.
+
+    Each item is (audio, viseme_timeline); the timeline comes from the same
+    forward pass as the audio, so lip-sync costs nothing extra.
     """
-    while not stop_event.is_set():
+    while session_active(gen):
         try:
             text = speak_q.get(timeout=0.2)
         except queue.Empty:
@@ -374,9 +451,9 @@ def synth_worker(tts: KokoroTTS):
         # sees "both queues empty" while a sentence is still being produced.
         synth_busy.set()
         try:
-            audio = tts.synthesize(text)
+            audio, timeline = tts.synthesize_with_visemes(text)
             if audio.size and not interrupt_event.is_set():
-                audio_q.put(audio)
+                audio_q.put((audio, timeline))
         except Exception as e:
             print(f"\n[TTS] synthesis error: {e}")
         finally:
@@ -388,7 +465,7 @@ def more_speech_coming() -> bool:
     return (not audio_q.empty()) or (not speak_q.empty()) or synth_busy.is_set()
 
 
-def speak_worker(tts: KokoroTTS):
+def speak_worker(tts: KokoroTTS, gen: int):
     """Play synthesized audio through one long-lived output stream.
 
     One stream is reused for the whole session. Per sentence this avoids the
@@ -398,10 +475,14 @@ def speak_worker(tts: KokoroTTS):
     """
     out = sd.OutputStream(samplerate=tts.sample_rate, channels=1, dtype="float32")
     out.start()
+    # Monotonic time at which the audio already handed to PortAudio finishes.
+    # Used to predict when the next sentence will actually be *heard*, so the
+    # browser can start the mouth animation at the right moment.
+    playhead = 0.0
     try:
-        while not stop_event.is_set():
+        while session_active(gen):
             try:
-                audio = audio_q.get(timeout=0.2)
+                audio, timeline = audio_q.get(timeout=0.2)
             except queue.Empty:
                 continue
             if interrupt_event.is_set():
@@ -409,6 +490,18 @@ def speak_worker(tts: KokoroTTS):
 
             assistant_speaking.set()
             emit("state", state="speaking")
+
+            # write() returns once PortAudio accepts the samples, so this
+            # sentence starts being heard either after the buffer latency (if
+            # the device is idle) or when the previous sentence finishes.
+            now = time.monotonic()
+            starts_at = max(now + out.latency, playhead)
+            if timeline:
+                emit("visemes",
+                     start_in_ms=int(round((starts_at - now) * 1000)),
+                     timeline=visemes.to_wire(timeline))
+            playhead = starts_at + audio.size / tts.sample_rate
+
             play_interruptible(out, audio)
 
             if interrupt_event.is_set():
@@ -417,6 +510,7 @@ def speak_worker(tts: KokoroTTS):
                 # drain it (~190 ms), i.e. keep talking over the user.
                 drain_queue(audio_q)
                 out.abort()
+                playhead = 0.0  # buffer discarded, nothing is queued to be heard
                 assistant_speaking.clear()
                 emit("state", state="listening")
                 continue
@@ -498,12 +592,20 @@ def load_tts() -> KokoroTTS:
 
 
 def start_pipeline(persona_key: str = config.DEFAULT_PERSONA, reset_history: bool = True):
-    """Start mic capture and all worker threads. No-op if already running."""
-    global _threads, _input_stream
+    """Start mic capture and all worker threads.
+
+    If a session is already live this switches persona on it rather than doing
+    nothing, so the caller's choice always takes effect.
+    """
+    global _threads, _input_stream, _generation
     with _lifecycle_lock:
         if is_running():
+            set_persona(persona_key)
             return
-        # Fresh state for a new session.
+        # Fresh state for a new session. Bumping the generation retires any
+        # worker from a previous session that has not finished unwinding yet.
+        _generation += 1
+        gen = _generation
         stop_event.clear()
         interrupt_event.clear()
         assistant_speaking.clear()
@@ -511,16 +613,16 @@ def start_pipeline(persona_key: str = config.DEFAULT_PERSONA, reset_history: boo
         for q in (raw_q, utterance_q, speak_q, audio_q):
             drain_queue(q)
 
-        conversation[0]["content"] = config.build_system_prompt(persona_key)
+        set_persona(persona_key)
         if reset_history:
             del conversation[1:]
 
         tts = load_tts()
         _threads = [
-            threading.Thread(target=vad_worker, name="vad", daemon=True),
-            threading.Thread(target=brain_worker, name="brain", daemon=True),
-            threading.Thread(target=synth_worker, args=(tts,), name="synth", daemon=True),
-            threading.Thread(target=speak_worker, args=(tts,), name="speak", daemon=True),
+            threading.Thread(target=vad_worker, args=(gen,), name="vad", daemon=True),
+            threading.Thread(target=brain_worker, args=(gen,), name="brain", daemon=True),
+            threading.Thread(target=synth_worker, args=(tts, gen), name="synth", daemon=True),
+            threading.Thread(target=speak_worker, args=(tts, gen), name="speak", daemon=True),
         ]
         for t in _threads:
             t.start()
@@ -534,10 +636,19 @@ def start_pipeline(persona_key: str = config.DEFAULT_PERSONA, reset_history: boo
 
 
 def stop_pipeline():
-    """Stop mic capture and shut the worker threads down."""
+    """Stop mic capture and shut the worker threads down.
+
+    A worker can be deep inside a blocking call (Whisper decoding, or an LLM
+    response still streaming), so joining is best-effort: `interrupt_event`
+    unblocks playback and the HTTP stream, and any straggler is retired by the
+    generation bump on the next start. `_threads` is cleared either way, so a
+    slow shutdown can never make the next start a silent no-op -- that used to
+    leave the session running under its original persona.
+    """
     global _threads, _input_stream
     with _lifecycle_lock:
         stop_event.set()
+        interrupt_event.set()
         if _input_stream is not None:
             try:
                 _input_stream.stop()
@@ -545,10 +656,15 @@ def stop_pipeline():
             except Exception as e:
                 print(f"[audio] input stream close: {e}")
             _input_stream = None
+        deadline = time.monotonic() + 5.0
         for t in _threads:
-            t.join(timeout=3)
+            t.join(timeout=max(0.1, deadline - time.monotonic()))
+        stragglers = [t.name for t in _threads if t.is_alive()]
+        if stragglers:
+            print(f"[pipeline] still unwinding in the background: {', '.join(stragglers)}")
         _threads = []
         assistant_speaking.clear()
+        interrupt_event.clear()
         for q in (raw_q, utterance_q, speak_q, audio_q):
             drain_queue(q)
         emit("state", state="idle")

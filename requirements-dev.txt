@@ -1,0 +1,2 @@
+# Development-only dependencies (not needed to run the tutor).
+pytest==8.3.4
