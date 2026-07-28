@@ -13,6 +13,7 @@ import queue
 import re
 import sys
 import threading
+import time
 
 import numpy as np
 import requests
@@ -29,13 +30,23 @@ from tts import KokoroTTS
 raw_q: "queue.Queue[np.ndarray]" = queue.Queue()      # 512-sample mic frames
 utterance_q: "queue.Queue[np.ndarray]" = queue.Queue()  # complete user utterances
 speak_q: "queue.Queue[str]" = queue.Queue()             # sentences to speak aloud
+audio_q: "queue.Queue[np.ndarray]" = queue.Queue()      # synthesized audio ready to play
 
 stop_event = threading.Event()          # global shutdown
 assistant_speaking = threading.Event()  # set while TTS is playing
 interrupt_event = threading.Event()     # set on barge-in to abort LLM + TTS
+synth_busy = threading.Event()          # set while TTS synthesis is in flight
 
 conversation = [{"role": "system", "content": config.SYSTEM_PROMPT}]
-MAX_HISTORY_TURNS = 12  # keep the system prompt + last N messages
+# History is trimmed in blocks rather than every turn. Dropping the oldest
+# message each turn changes the token prefix after the system prompt, which
+# invalidates llama.cpp's KV cache and forces a full re-prefill of the whole
+# conversation (measured: 511 ms / 179 tokens versus 35 ms / 1 token when the
+# prefix is untouched). Trimming only once we exceed HISTORY_HIGH_WATER, and
+# then cutting back to HISTORY_LOW_WATER, amortizes that one-off cost over
+# many turns instead of paying it on every reply.
+HISTORY_HIGH_WATER = 24  # messages after the system prompt before trimming
+HISTORY_LOW_WATER = 12   # messages kept after a trim
 
 SENTENCE_END = re.compile(r"[.!?;:]+[\s\"')\]]*\s|[\n]+")
 
@@ -105,8 +116,8 @@ def vad_worker():
                     if speech_run >= barge_in_frames:
                         print("\n[VAD] barge-in detected -> interrupting tutor")
                         interrupt_event.set()
-                        with speak_q.mutex:
-                            speak_q.queue.clear()
+                        drain_queue(speak_q)
+                        drain_queue(audio_q)
                         speech_run = 0
                 else:
                     speech_run = 0
@@ -242,9 +253,23 @@ def stream_llm(prompt: str):
         yield sentence.strip()
     if full_reply.strip():
         conversation.append({"role": "assistant", "content": full_reply.strip()})
-    # Trim history (keep system prompt at index 0)
-    if len(conversation) > MAX_HISTORY_TURNS + 1:
-        del conversation[1:len(conversation) - MAX_HISTORY_TURNS]
+    trim_history()
+
+
+def trim_history():
+    """Drop the oldest turns, but only once history grows past the high water mark.
+
+    Keeps the system prompt at index 0 and always resumes at a "user" message so
+    the transcript stays a valid user/assistant alternation.
+    """
+    if len(conversation) - 1 <= HISTORY_HIGH_WATER:
+        return
+    cut = len(conversation) - HISTORY_LOW_WATER
+    # Advance to the next user turn so we never lead with a bare assistant reply.
+    while cut < len(conversation) and conversation[cut]["role"] != "user":
+        cut += 1
+    if cut < len(conversation):
+        del conversation[1:cut]
 
 
 def brain_worker():
@@ -266,20 +291,41 @@ def brain_worker():
 
 
 # ---------------------------------------------------------------------------
-# 4. TTS playback (interruptible)
+# 4. TTS synthesis + playback (interruptible, pipelined)
 # ---------------------------------------------------------------------------
-def play_interruptible(audio: np.ndarray, sample_rate: int):
+def drain_queue(q: queue.Queue):
+    """Discard everything currently queued (used on barge-in)."""
+    with q.mutex:
+        q.queue.clear()
+
+
+def play_interruptible(out: sd.OutputStream, audio: np.ndarray):
+    """Write `audio` to an already-open stream, stopping early on barge-in.
+
+    Note: write() returns once PortAudio has accepted the samples, not once they
+    have been heard -- roughly `out.latency` of audio is still buffered when the
+    final write returns. Callers must account for that tail before treating the
+    speaker as silent.
+    """
     if audio.size == 0:
         return
     block = 2048
-    with sd.OutputStream(samplerate=sample_rate, channels=1, dtype="float32") as out:
-        for i in range(0, len(audio), block):
-            if interrupt_event.is_set() or stop_event.is_set():
-                break
-            out.write(audio[i:i + block])
+    if out.stopped:
+        out.start()  # ~26 ms; only needed after a barge-in abort()
+    for i in range(0, len(audio), block):
+        if interrupt_event.is_set() or stop_event.is_set():
+            break
+        out.write(audio[i:i + block])
 
 
-def speak_worker(tts: KokoroTTS):
+def synth_worker(tts: KokoroTTS):
+    """Synthesize queued sentences into audio, ahead of playback.
+
+    Runs in its own thread so synthesis of the next sentence overlaps playback
+    of the current one. Kokoro synthesizes at RTF ~0.05, so a sentence is ready
+    far sooner than it takes to speak the previous one and the inter-sentence
+    gap disappears entirely.
+    """
     while not stop_event.is_set():
         try:
             text = speak_q.get(timeout=0.2)
@@ -287,18 +333,65 @@ def speak_worker(tts: KokoroTTS):
             continue
         if interrupt_event.is_set():
             continue
+        # synth_busy stays set until the audio is queued, so the player never
+        # sees "both queues empty" while a sentence is still being produced.
+        synth_busy.set()
         try:
             audio = tts.synthesize(text)
+            if audio.size and not interrupt_event.is_set():
+                audio_q.put(audio)
         except Exception as e:
             print(f"\n[TTS] synthesis error: {e}")
-            continue
-        assistant_speaking.set()
-        try:
-            play_interruptible(audio, tts.sample_rate)
         finally:
-            # small tail so the last block flushes before we resume listening
-            if not speak_q.qsize():
+            synth_busy.clear()
+
+
+def more_speech_coming() -> bool:
+    """True while any sentence is queued, being synthesized, or ready to play."""
+    return (not audio_q.empty()) or (not speak_q.empty()) or synth_busy.is_set()
+
+
+def speak_worker(tts: KokoroTTS):
+    """Play synthesized audio through one long-lived output stream.
+
+    One stream is reused for the whole session. Per sentence this avoids the
+    ~190 ms that closing a stream spends draining its buffer (constructing a
+    stream is only ~10 ms; the drain was the real cost), measured as 690 ms vs
+    500 ms of wall time to play 500 ms of audio.
+    """
+    out = sd.OutputStream(samplerate=tts.sample_rate, channels=1, dtype="float32")
+    out.start()
+    try:
+        while not stop_event.is_set():
+            try:
+                audio = audio_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if interrupt_event.is_set():
+                continue
+
+            assistant_speaking.set()
+            play_interruptible(out, audio)
+
+            if interrupt_event.is_set():
+                # Barge-in: drop queued audio and cut playback immediately.
+                # abort() discards PortAudio's ~121 ms buffer where stop() would
+                # drain it (~190 ms), i.e. keep talking over the user.
+                drain_queue(audio_q)
+                out.abort()
                 assistant_speaking.clear()
+                continue
+
+            # Only release the mic once nothing else is coming AND the audio
+            # still buffered in PortAudio has actually been heard. Clearing
+            # earlier re-opens the mic while the speaker is still sounding,
+            # which feeds the tutor's own tail back in as user speech.
+            if not more_speech_coming():
+                time.sleep(out.latency)
+                if not more_speech_coming():
+                    assistant_speaking.clear()
+    finally:
+        out.close(ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +451,7 @@ def main():
     threads = [
         threading.Thread(target=vad_worker, name="vad", daemon=True),
         threading.Thread(target=brain_worker, name="brain", daemon=True),
+        threading.Thread(target=synth_worker, args=(tts,), name="synth", daemon=True),
         threading.Thread(target=speak_worker, args=(tts,), name="speak", daemon=True),
     ]
     for t in threads:
