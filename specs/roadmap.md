@@ -25,9 +25,13 @@ Make the existing experience reliable and easy to adopt.
 
 - Structured logging (levels, quiet/verbose modes) replacing ad-hoc prints.
 - Graceful startup/shutdown and clear error messages when llama-server is down.
+  *(Partly delivered: the UI surfaces an "LLM unreachable" error, and stopping a
+  session now interrupts playback and a streaming reply instead of leaving
+  threads to unwind silently. Logging levels are still open.)*
 - Automated tests for the STT hallucination filters and sentence-splitting.
-  *(Delivered: `tests/` runs 99 model-free unit tests in under a second, also
-  covering the viseme timeline, history trimming and persona prompts.)*
+  *(Delivered: `tests/` runs 127 model-free unit tests in about a second, also
+  covering the viseme timeline, history trimming, persona switching and the
+  avatar asset contract.)*
 - A single launcher that starts the LLM server and agent together.
   *(Delivered: `scripts/start_all.sh`.)*
 - Device selection / listing for input and output audio devices.
@@ -55,9 +59,15 @@ Improve the tutoring experience itself.
 Widen who and how VirtualTutor can serve.
 
 - Multilingual STT/TTS support (whisper multilingual + non-English Kokoro voices).
+  *(Groundwork: `VT_TTS_LANG` selects the Kokoro pipeline, and the viseme map
+  covers IPA beyond US English.)*
 - Selectable quality tiers (small/medium Whisper, 7B/14B LLM) with guidance on
   memory tradeoffs.
 - Optional lightweight UI (transcript view, push-to-talk, voice/model pickers).
+  *(Delivered: local web UI with start/stop, live transcript, mic level, a
+  persona picker that works mid-session, and a lip-synced avatar — either a
+  drawn face or a photo one built from a short video. Push-to-talk and
+  voice/model pickers are still open.)*
 - Full-duplex mode with software echo cancellation for speaker use without
   headphones.
 
@@ -69,5 +79,9 @@ Widen who and how VirtualTutor can serve.
 - Tool/skill hooks so the tutor can look things up or run exercises.
 - Packaging as a distributable app or CLI installable outside the repo.
 - Session analytics and progress tracking for learners.
+- 3D avatar: the viseme timeline already uses VRM/ARKit shape names, so it could
+  drive a rigged head instead of the 2D mouth.
+- Avatar builder that measures its own geometry (face detection or an
+  interactive picker) instead of per-clip constants.
 
 **Depends on:** Phase 3.

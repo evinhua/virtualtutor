@@ -42,6 +42,10 @@ memory for responsive, natural back-and-forth conversation.
 - **Natural turn-taking** — reliable end-of-speech detection (~0.8 s pause) and
   optional barge-in to interrupt the tutor mid-sentence.
 - **Clean transcription** — no hallucinated filler phrases reaching the LLM.
+- **A face that matches the voice** — lip-sync driven by the actual phonemes
+  being spoken, accurate to the millisecond, with no additional model.
+- **A personality you can change** — personas are part of the tutor's identity,
+  selectable at startup and switchable mid-conversation.
 - **Runs within 36 GB** unified memory on an Apple M3 Pro with all models loaded
   simultaneously.
 
@@ -51,11 +55,20 @@ memory for responsive, natural back-and-forth conversation.
   non-negotiable defaults.
 - **Low latency by design** — stream and pipeline every stage; never wait for a
   whole response when a sentence will do.
-- **Concurrency without collision** — VAD, brain (STT+LLM), and speech run in
-  separate threads communicating via queues.
+- **Concurrency without collision** — VAD, brain (STT+LLM), synthesis and
+  playback run in separate threads communicating via queues, and a session that
+  is shutting down must never bleed into the next one.
 - **Robustness over cleverness** — defensive layers (energy gates, confidence
   thresholds, phrase blocklists, echo flushing) keep the experience stable.
 - **Conversational, spoken-first output** — short, plain-language replies suited
   to text-to-speech, never markdown or code blocks.
 - **Configurable, not hardcoded** — every model and behavior knob is overridable
   via environment variables.
+- **Reuse what the models already compute** — the mouth is animated from
+  Kokoro's own duration predictor rather than a second model, and the avatar is
+  aligned with the tensor library already in the dependency list.
+- **No dependency the feature does not need** — the UI is stdlib HTTP and static
+  files, with no framework, bundler, or build step.
+- **The fragile logic is tested** — timeline construction, sentence splitting,
+  transcription guards, history trimming and persona switching are covered by
+  fast tests that need no models.

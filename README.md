@@ -9,6 +9,8 @@ Microphone ─PCM─▶ Silero VAD ─audio─▶ mlx-whisper ─text─▶ llam
                   (speech end)         (STT)                    │ token stream
                                                                 ▼
 Speakers ◀─PCM─ Kokoro TTS ◀─sentences─ sentence-split buffer ◀─┘
+                     │ phoneme durations
+                     └──▶ viseme timeline ──▶ browser (lip-synced avatar)
 ```
 
 All four models sit in unified memory at once, giving low-latency responses.
@@ -22,10 +24,13 @@ Tested on **Apple M3 Pro / 36 GB / macOS**.
 | STT   | `mlx-whisper` (`whisper-small.en`) | Metal-accelerated transcription |
 | LLM   | `llama.cpp` server + Qwen2.5-7B-Instruct Q4_K_M | OpenAI-compatible, streaming |
 | TTS   | Kokoro-82M via `mlx-audio` | 24 kHz, voice `af_heart` |
+| Lip-sync | Kokoro's own phoneme durations | no second model, frame-accurate |
+| UI    | stdlib HTTP + SSE, static HTML/CSS/JS | optional; CLI works alone |
 
-The pipeline is threaded: VAD, brain (STT+LLM), and speech run concurrently, and
-sentences are streamed to TTS as soon as the LLM finishes each one to minimize
-perceived latency.
+The pipeline runs four worker threads — VAD, brain (STT+LLM), synthesis, and
+playback — communicating over queues, so the next sentence is synthesized while
+the current one is still being spoken. Sentences go to TTS as soon as the LLM
+finishes each one, to minimize perceived latency.
 
 ## Setup
 
@@ -112,6 +117,15 @@ Python pipeline as the CLI, and the browser is only the control surface and
 transcript view. The server is built on the Python standard library
 (`ThreadingHTTPServer` + Server-Sent Events), so it adds no dependencies.
 
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /api/personas` | available personas (key, name, blurb) |
+| `GET /api/status` | whether a session is live, and the active persona |
+| `GET /api/events` | SSE stream: state, transcript, mic level, visemes |
+| `POST /api/start` | start listening — body `{"persona": "tutor"}` |
+| `POST /api/persona` | switch persona, mid-session if one is running |
+| `POST /api/stop` | stop listening |
+
 | Env var | Default | Purpose |
 |---------|---------|---------|
 | `VT_WEB_HOST` | `127.0.0.1` | web UI bind address |
@@ -196,13 +210,17 @@ reachability.
 
 Unit tests cover the pure logic that is easy to break and hard to notice: the
 viseme timeline, the sentence splitter feeding TTS, the Whisper
-anti-hallucination guards, history trimming, and persona prompts. They load no
-models, so the suite runs in under a second.
+anti-hallucination guards, history trimming, persona prompts and switching, and
+the photo avatar's asset contract. They load no models and open no audio
+devices, so the suite (127 tests) runs in about a second.
 
 ```bash
 ./.venv/bin/pip install -r requirements-dev.txt   # once
 ./.venv/bin/python -m pytest
 ```
+
+Tests that need the generated avatar sprites skip themselves when
+`web/avatar/` has not been built.
 
 ## Configuration
 
