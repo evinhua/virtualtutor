@@ -353,21 +353,38 @@ const avatar = (() => {
   let size = 168, dpr = 1;
 
   // --- photo mode ---------------------------------------------------------
-  const CROSSFADE_MS = 70;   // a viseme lasts >= 25 ms; ease, do not snap
-  let photo = null;          // { base, patches, patchBox, scale } once loaded
-  let current = "sil";       // viseme currently being shown
-  let previous = "sil";      // viseme being faded out
-  let changedAt = 0;
+  /* Mouth motion.
+
+     Kokoro's timeline is phoneme-accurate, which means it contains plenty of
+     25 ms spans. Snapping to each one -- or restarting a crossfade on every
+     change -- looks like flicker, because a fade longer than the span never
+     finishes before the next one begins.
+
+     So the mouth has inertia instead: every viseme keeps a weight that rises
+     toward 1 while it is the target and decays afterwards, and the rendered
+     mouth is the weighted blend of the few strongest. A 25 ms consonant only
+     gets part of the way to its shape before decaying, which is what real
+     articulation does -- the lips never fully reach the target of a fleeting
+     stop between two vowels. Opening is quicker than closing, as in speech.
+
+     Time constants are in milliseconds and applied against real frame deltas,
+     so motion is identical on 60 Hz and 120 Hz displays. */
+  const ATTACK_MS = 55;      // toward the current viseme
+  const RELEASE_MS = 95;     // away from previous ones
+  const MAX_LAYERS = 3;      // strongest shapes blended per frame
+  const WEIGHT_FLOOR = 0.02; // below this a shape is dropped from the blend
+
+  let photo = null;          // { base, patches, mask, mix, manifest } once loaded
+  let weights = { sil: 1 };  // viseme -> 0..1 contribution to the current mouth
+  let lastFrameAt = performance.now();
 
   /** Alpha mask matching build_photo_avatar.py's mouth_mask, in patch space. */
-  function maskedPatch(image, manifest) {
+  function buildMask(manifest) {
     const p = manifest.patch, m = manifest.mouth;
-    const out = document.createElement("canvas");
-    out.width = p.w;
-    out.height = p.h;
-    const c = out.getContext("2d");
-    c.drawImage(image, 0, 0, p.w, p.h);
-
+    const mask = document.createElement("canvas");
+    mask.width = p.w;
+    mask.height = p.h;
+    const c = mask.getContext("2d");
     const alpha = c.createImageData(p.w, p.h);
     const ramp = m.feather / Math.min(m.rx, m.ry);
     for (let y = 0; y < p.h; y++) {
@@ -376,17 +393,11 @@ const avatar = (() => {
         const ny = (y + p.y - m.cy) / m.ry;
         const d = Math.sqrt(nx * nx + ny * ny);
         const t = Math.min(1, Math.max(0, (1 + ramp - d) / ramp));
-        const i = (y * p.w + x) * 4 + 3;
-        alpha.data[i] = Math.round(255 * t * t * (3 - 2 * t));  // smoothstep
+        alpha.data[(y * p.w + x) * 4 + 3] = Math.round(255 * t * t * (3 - 2 * t));
       }
     }
-    const maskCanvas = document.createElement("canvas");
-    maskCanvas.width = p.w;
-    maskCanvas.height = p.h;
-    maskCanvas.getContext("2d").putImageData(alpha, 0, 0);
-    c.globalCompositeOperation = "destination-in";
-    c.drawImage(maskCanvas, 0, 0);
-    return out;
+    c.putImageData(alpha, 0, 0);
+    return mask;
   }
 
   function loadImage(src) {
@@ -413,9 +424,15 @@ const avatar = (() => {
       const base = await loadImage(`avatar/${manifest.base}`);
       const patches = {};
       await Promise.all(Object.entries(manifest.images).map(async ([viseme, file]) => {
-        patches[viseme] = maskedPatch(await loadImage(`avatar/${file}`), manifest);
+        patches[viseme] = await loadImage(`avatar/${file}`);
       }));
-      photo = { base, patches, manifest };
+      // Patches stay unmasked so several can be averaged first; the mask is
+      // applied once to the blend, which keeps the result identical to the
+      // single-patch composite the builder produced.
+      const mix = document.createElement("canvas");
+      mix.width = manifest.patch.w;
+      mix.height = manifest.patch.h;
+      photo = { base, patches, mask: buildMask(manifest), mix, manifest };
       canvas.removeAttribute("aria-hidden");
       canvas.setAttribute("role", "img");
       canvas.setAttribute("aria-label", "Tutor avatar");
@@ -449,36 +466,59 @@ const avatar = (() => {
     return timeline[cursor][1] || "sil";
   }
 
-  function targetShape(now) {
-    return MOUTH[visemeAt(now)] || MOUTH.sil;
+  /** Advance each viseme's weight toward its target for a `dt` ms frame. */
+  function updateWeights(target, dt) {
+    const attack = reduceMotion ? 1 : 1 - Math.exp(-dt / ATTACK_MS);
+    const decay = reduceMotion ? 0 : Math.exp(-dt / RELEASE_MS);
+    weights[target] = (weights[target] || 0) + (1 - (weights[target] || 0)) * attack;
+    for (const v in weights) {
+      if (v === target) continue;
+      const w = weights[v] * decay;
+      if (w < WEIGHT_FLOOR) delete weights[v];
+      else weights[v] = w;
+    }
+    return weights;
   }
 
-  /** Photo avatar: base face + the current mouth patch, cross-faded. */
-  function drawPhoto(now) {
-    const viseme = visemeAt(now);
-    if (viseme !== current) {
-      previous = current;
-      current = viseme;
-      changedAt = now;
-    }
+  /** The strongest shapes, normalised so their weights sum to 1. */
+  function blendLayers(available) {
+    const layers = Object.entries(weights)
+      .filter(([v]) => !available || available[v])
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, MAX_LAYERS);
+    const total = layers.reduce((sum, [, w]) => sum + w, 0);
+    if (!total) return [];
+    return layers.map(([v, w]) => [v, w / total]);
+  }
+
+  /** Photo avatar: base face + a blend of the strongest mouth patches. */
+  function drawPhoto(now, dt) {
+    updateWeights(visemeAt(now), dt);
+    const layers = blendLayers(photo.patches);
     const p = photo.manifest.patch;
     const k = size / photo.manifest.size;        // exported px -> CSS px
-    const px = p.x * k, py = p.y * k, pw = p.w * k, ph = p.h * k;
-    const fade = reduceMotion ? 1
-      : Math.min(1, (now - changedAt) / CROSSFADE_MS);
+
+    // Average the unmasked patches, then mask once. Each draw contributes its
+    // share of the running total, which makes the result an exact weighted
+    // mean rather than a stack of partial fades.
+    const mc = photo.mix.getContext("2d");
+    mc.globalCompositeOperation = "source-over";
+    mc.clearRect(0, 0, p.w, p.h);
+    let acc = 0;
+    for (const [viseme, weight] of layers) {
+      acc += weight;
+      mc.globalAlpha = weight / acc;
+      mc.drawImage(photo.patches[viseme], 0, 0, p.w, p.h);
+    }
+    mc.globalAlpha = 1;
+    mc.globalCompositeOperation = "destination-in";
+    mc.drawImage(photo.mask, 0, 0);
+    mc.globalCompositeOperation = "source-over";
 
     ctx.clearRect(0, 0, size, size);
     ctx.drawImage(photo.base, 0, 0, size, size);
-    const before = photo.patches[previous];
-    const after = photo.patches[current];
-    if (before && fade < 1) {
-      ctx.globalAlpha = 1;
-      ctx.drawImage(before, px, py, pw, ph);
-    }
-    if (after) {
-      ctx.globalAlpha = before ? fade : 1;
-      ctx.drawImage(after, px, py, pw, ph);
-      ctx.globalAlpha = 1;
+    if (layers.length) {
+      ctx.drawImage(photo.mix, p.x * k, p.y * k, p.w * k, p.h * k);
     }
 
     // Thin ring tinted by pipeline state: the only chrome the photo needs.
@@ -502,25 +542,40 @@ const avatar = (() => {
   }
 
   function draw(now) {
+    // Real elapsed time, so motion is the same on 60 Hz and 120 Hz displays and
+    // survives a tab being throttled in the background.
+    const dt = Math.min(120, Math.max(1, now - lastFrameAt));
+    lastFrameAt = now;
+
     if (photo) {
-      drawPhoto(now);
+      drawPhoto(now, dt);
       requestAnimationFrame(draw);
       return;
     }
-    const tgt = targetShape(now);
-    // Ease toward the target so 25 ms phonemes do not look like flicker.
-    const k = reduceMotion ? 1 : 0.34;
+    // The drawn mouth blends the same weights the photo avatar uses, so a
+    // fleeting consonant only nudges the shape instead of snapping to it.
+    updateWeights(visemeAt(now), dt);
+    const tgt = { w: 0, h: 0, r: 0 };
+    for (const [viseme, weight] of blendLayers(MOUTH)) {
+      const m = MOUTH[viseme];
+      tgt.w += m.w * weight;
+      tgt.h += m.h * weight;
+      tgt.r += m.r * weight;
+    }
+    // A little extra easing on top, time-based rather than per-frame.
+    const k = reduceMotion ? 1 : 1 - Math.exp(-dt / 45);
     shape.w = lerp(shape.w, tgt.w, k);
     shape.h = lerp(shape.h, tgt.h, k);
     shape.r = lerp(shape.r, tgt.r, k);
 
     // Blink on an irregular schedule; suppressed under reduced motion.
     if (!reduceMotion) {
+      const step = dt / 60;                    // ~60 ms to close or open
       if (now > blinkAt) {
-        blink = Math.min(1, blink + 0.25);
+        blink = Math.min(1, blink + step);
         if (blink >= 1) { blinkAt = now + 1800 + Math.random() * 3500; }
       } else {
-        blink = Math.max(0, blink - 0.2);
+        blink = Math.max(0, blink - step);
       }
     }
 

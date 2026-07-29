@@ -150,6 +150,29 @@ half-duplex echo handling. To stay in sync, the server sends the timeline with
 the delay until the audio is actually audible (the PortAudio buffer plus
 anything still playing), and the browser animates against that.
 
+The mouth has **inertia** rather than switching shape per span. A timeline of
+real phonemes contains plenty of 25 ms spans, and snapping to each one — or
+restarting a crossfade on every change — flickers, because a fade longer than
+the span never finishes. Instead every viseme keeps a weight that rises toward 1
+while it is the target (55 ms) and decays afterwards (95 ms, slower, as closing
+is in speech), and the rendered mouth is the weighted blend of the three
+strongest. A fleeting consonant therefore only gets part of the way to its
+shape, which is what articulation actually does: measured on one sentence, brief
+`PP`, `FF`, `CH`, `KK` and `TH` spans peak at 0.37–0.50 weight while sustained
+vowels reach 1.0. Weights advance against real frame deltas, so motion is
+identical on 60 Hz and 120 Hz displays.
+
+Rendered pixel change inside the mouth region, per frame, on the same sentence:
+
+| | mean | p95 | max |
+|---|---|---|---|
+| per-span crossfade | 2.74 | 7.10 | 10.99 |
+| weighted blend | 1.31 | 3.20 | 4.11 |
+
+The patches are stored unmasked and the feathered ellipse is applied once to the
+blend, so averaging several shapes stays identical to the single-patch composite
+the builder produced.
+
 Viseme names follow the VRM/ARKit convention (`aa`, `ih`, `ou`, `oh`, `E` plus
 consonant groups `PP`, `FF`, `TH`, `DD`, `SS`, `CH`, `KK`, `RR`), so the same
 timeline could drive a 3D VRM avatar instead of the 2D canvas mouth.
