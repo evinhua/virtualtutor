@@ -23,10 +23,12 @@ microphone.
 
 Run: ./.venv/bin/python src/server.py     then open http://127.0.0.1:8800
 """
+import errno
 import json
 import mimetypes
 import os
 import queue
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -99,6 +101,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        # If the request body could not be drained, say so rather than letting
+        # the client reuse a socket we are about to close.
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
 
@@ -116,11 +122,22 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _read_json(self) -> dict:
+        """Read and parse the request body, always consuming it.
+
+        Consuming matters even when a route ignores the body: this is an
+        HTTP/1.1 keep-alive server, so anything left unread is parsed as the
+        start of the next request, which the base handler rejects with 501.
+        """
+        if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
+            # Cannot reliably drain a chunked body here; do not reuse the socket.
+            self.close_connection = True
+            return {}
         length = int(self.headers.get("Content-Length") or 0)
         if not length:
             return {}
+        raw = self.rfile.read(length)
         try:
-            return json.loads(self.rfile.read(length) or b"{}")
+            return json.loads(raw or b"{}")
         except json.JSONDecodeError:
             return {}
 
@@ -155,8 +172,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         route = self.path.split("?", 1)[0]
+        # Read the body up front, whatever the route: an unread body would be
+        # taken for the next request line on this kept-alive connection. That is
+        # what used to make the first Start after a Stop fail with 501.
+        body = self._read_json()
         if route == "/api/start":
-            persona = str(self._read_json().get("persona", config.DEFAULT_PERSONA))
+            persona = str(body.get("persona", config.DEFAULT_PERSONA))
             if persona not in config.PERSONAS:
                 persona = config.DEFAULT_PERSONA
             try:
@@ -171,7 +192,7 @@ class Handler(BaseHTTPRequestHandler):
             # Switching mid-session: rewrite the system prompt in place so the
             # next reply is in the new personality, running or not.
             persona = voice_agent.set_persona(
-                str(self._read_json().get("persona", config.DEFAULT_PERSONA)))
+                str(body.get("persona", config.DEFAULT_PERSONA)))
             self._send_json({"ok": True, "persona": persona,
                              "persona_name": config.persona_name(persona)})
         elif route == "/api/stop":
@@ -220,7 +241,18 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     threading.Thread(target=pump_events, name="events", daemon=True).start()
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    try:
+        server = ThreadingHTTPServer((HOST, PORT), Handler)
+    except OSError as e:
+        if e.errno != errno.EADDRINUSE:
+            raise
+        # A stale server on the port is easy to miss, and every request then
+        # goes to the old process -- which looks like the new code not working.
+        print(f"Port {PORT} is already in use, so the web UI did not start.\n"
+              f"Stop whatever is listening on {HOST}:{PORT} (an earlier\n"
+              f"VirtualTutor, most likely) or pick another port with "
+              f"VT_WEB_PORT.", file=sys.stderr)
+        raise SystemExit(1)
     server.daemon_threads = True
     print(f"VirtualTutor web UI  ->  http://{HOST}:{PORT}")
     print("Local only, no authentication. Ctrl+C to quit.")
