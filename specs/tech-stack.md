@@ -36,6 +36,15 @@ fully local operation possible.
 - **Two renderers.** A vector face is the default and needs no assets; if
   `web/avatar/manifest.json` exists, a photo avatar is used instead — one base
   face plus a mouth patch per viseme, feathered in through an elliptical mask.
+- **The mouth has inertia.** A phoneme-accurate timeline contains many 25 ms
+  spans, so switching shape per span (or restarting a crossfade on each change)
+  flickers. Each viseme instead holds a weight that rises while it is the target
+  (55 ms) and decays afterwards (95 ms), and the mouth is the weighted blend of
+  the three strongest — a brief consonant only partly reaches its shape, as in
+  real articulation. Patches are therefore stored unmasked so several can be
+  averaged before the mask is applied once.
+- **Animation runs on elapsed time,** not per-frame fractions, so it looks the
+  same at 60 Hz and 120 Hz and cannot lurch when a tab is throttled.
 - **Avatar authoring lives in `tools/`** and is not needed at runtime. Alignment
   uses `torch.grid_sample` and normalised cross-correlation over a scale/rotation
   grid rather than a face-landmark library, which keeps `requirements.txt`
@@ -78,14 +87,24 @@ fully local operation possible.
   tutoring rules with a personality and the persona's name (so "who are you?" is
   answered in character); `set_persona()` rewrites the prompt in place, which
   makes mid-session switching possible while keeping the conversation.
+- **The HTTP server keeps connections alive,** so every POST handler must consume
+  its request body even when it ignores it. An unread body is parsed as the next
+  request line and answered with 501, which showed up as the first Start after a
+  Stop failing. `do_POST` reads the body once, before dispatch.
 
 ## Testing
 
-- **`pytest`** (`requirements-dev.txt`, pinned) covering the pure logic:
-  viseme timeline, sentence splitting, STT hallucination guards, history
-  trimming, persona prompts and switching, and the avatar asset contract.
-- **No models, no audio devices.** The suite runs in about a second, and tests
-  needing generated avatar sprites skip themselves when `web/avatar/` is absent.
+- **`pytest`** (`requirements-dev.txt`, pinned), 137 tests: the viseme timeline
+  (43), STT hallucination guards (26), persona prompts (20), sentence splitting
+  (13), persona switching and session lifecycle (10), the HTTP layer (10), the
+  avatar asset contract (9) and history trimming (6).
+- **No models, no audio devices.** The suite runs in about two seconds. The HTTP
+  tests drive the real handler over a socket on an ephemeral port, reusing one
+  connection the way a browser does; avatar tests skip if `web/avatar/` has been
+  deleted.
+- **Regressions are pinned by reproducing them first** — reverting a fix must
+  make its test fail, which is how the 501 and the absorbed one-frame phoneme
+  were confirmed.
 
 ## Configuration & deployment
 

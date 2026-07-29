@@ -25,13 +25,15 @@ Make the existing experience reliable and easy to adopt.
 
 - Structured logging (levels, quiet/verbose modes) replacing ad-hoc prints.
 - Graceful startup/shutdown and clear error messages when llama-server is down.
-  *(Partly delivered: the UI surfaces an "LLM unreachable" error, and stopping a
-  session now interrupts playback and a streaming reply instead of leaving
-  threads to unwind silently. Logging levels are still open.)*
+  *(Mostly delivered: the UI surfaces an "LLM unreachable" error, stopping a
+  session interrupts playback and a streaming reply instead of leaving threads to
+  unwind silently, and the web server explains a busy port rather than dumping a
+  traceback. Logging levels are still open.)*
 - Automated tests for the STT hallucination filters and sentence-splitting.
-  *(Delivered: `tests/` runs 127 model-free unit tests in about a second, also
-  covering the viseme timeline, history trimming, persona switching and the
-  avatar asset contract.)*
+  *(Delivered: `tests/` runs 137 tests in about two seconds, without loading
+  models or opening audio devices — also covering the viseme timeline, history
+  trimming, persona switching, the HTTP layer over a real socket, and the avatar
+  asset contract.)*
 - A single launcher that starts the LLM server and agent together.
   *(Delivered: `scripts/start_all.sh`.)*
 - Device selection / listing for input and output audio devices.
@@ -66,8 +68,9 @@ Widen who and how VirtualTutor can serve.
 - Optional lightweight UI (transcript view, push-to-talk, voice/model pickers).
   *(Delivered: local web UI with start/stop, live transcript, mic level, a
   persona picker that works mid-session, and a lip-synced avatar — either a
-  drawn face or a photo one built from a short video. Push-to-talk and
-  voice/model pickers are still open.)*
+  drawn face or a photo one, whose mouth blends the strongest visemes so motion
+  stays smooth. The bundled sprites are committed, so a clone shows the photo
+  face. Push-to-talk and voice/model pickers are still open.)*
 - Full-duplex mode with software echo cancellation for speaker use without
   headphones.
 

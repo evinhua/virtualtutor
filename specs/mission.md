@@ -43,9 +43,12 @@ memory for responsive, natural back-and-forth conversation.
   optional barge-in to interrupt the tutor mid-sentence.
 - **Clean transcription** — no hallucinated filler phrases reaching the LLM.
 - **A face that matches the voice** — lip-sync driven by the actual phonemes
-  being spoken, accurate to the millisecond, with no additional model.
+  being spoken, accurate to the millisecond, with no additional model, and
+  moving smoothly rather than snapping between shapes.
 - **A personality you can change** — personas are part of the tutor's identity,
   selectable at startup and switchable mid-conversation.
+- **Start and stop are dependable** — a session can be stopped and restarted at
+  any moment, including mid-reply, without a stuck thread or a stale persona.
 - **Runs within 36 GB** unified memory on an Apple M3 Pro with all models loaded
   simultaneously.
 
@@ -70,5 +73,9 @@ memory for responsive, natural back-and-forth conversation.
 - **No dependency the feature does not need** — the UI is stdlib HTTP and static
   files, with no framework, bundler, or build step.
 - **The fragile logic is tested** — timeline construction, sentence splitting,
-  transcription guards, history trimming and persona switching are covered by
-  fast tests that need no models.
+  transcription guards, history trimming, persona switching and the HTTP layer
+  are covered by fast tests that need no models, and a fix for a reported bug
+  starts by reproducing it.
+- **Claims are measured** — smoothness, alignment quality and asset size are
+  reported as numbers rather than adjectives, so a change can be shown to be an
+  improvement.
