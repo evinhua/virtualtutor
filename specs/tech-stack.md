@@ -102,9 +102,10 @@ fully local operation possible.
   (CLI voice agent), `scripts/start_web.sh` (web frontend).
 - **Verification:** `src/verify.py` checks imports, VAD, TTS synthesis, a Whisper
   round-trip, and llama-server reachability — no microphone required.
-- **Generated artifacts stay out of git:** GGUF weights, sample audio, and the
-  photo avatar sprites in `web/avatar/` are all gitignored, so a fresh clone
-  falls back to the drawn face until sprites are built.
+- **Generated artifacts stay out of git** — GGUF weights and sample audio are
+  gitignored. The photo avatar sprites are the exception: at ~200 KB they are
+  committed, so a clone shows the real face without needing the source clip,
+  which is not in the repo.
 
 ## Notable constraints
 

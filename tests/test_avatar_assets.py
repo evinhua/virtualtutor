@@ -1,10 +1,11 @@
 """Tests for the photo avatar sprite set in web/avatar.
 
-The assets are generated (tools/build_photo_avatar.py) and gitignored, so every
-test skips when they are absent. What is worth checking is the contract between
-the generator and web/app.js: the viseme names must be exactly the ones the
-timeline can emit, the patch must sit inside the base image, and every declared
-image must exist at the size the renderer assumes.
+The bundled sprites are committed, but they are still generated output
+(tools/build_photo_avatar.py) and a user may delete them to get the drawn face
+back, so every test skips when they are absent. What is worth checking is the
+contract between the generator and web/app.js: the viseme names must be exactly
+the ones the timeline can emit, the patch must sit inside the base image, and
+every declared image must exist at the size the renderer assumes.
 """
 import json
 import shutil

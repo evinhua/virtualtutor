@@ -2,8 +2,9 @@
 models/*.gguf
 samples/*.wav
 samples/*.mp4
-# generated photo sprites (tools/build_photo_avatar.py)
-web/avatar/
+# web/avatar/ holds the built photo sprites. They are generated, but small
+# enough (~200 KB) to commit so a clone shows the real face without needing the
+# source video, which does stay out of the repo.
 __pycache__/
 *.pyc
 .pytest_cache/

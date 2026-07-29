@@ -1,0 +1,52 @@
+{
+ "size": 512,
+ "source": "avatar1.mp4",
+ "mode": "patch",
+ "base": "base.jpg",
+ "base_frame": 480,
+ "mouth": {
+  "cx": 265.8,
+  "cy": 384.0,
+  "rx": 172.3,
+  "ry": 123.1,
+  "feather": 37.4
+ },
+ "patch": {
+  "x": 56,
+  "y": 223,
+  "w": 420,
+  "h": 289
+ },
+ "frames": {
+  "sil": 480,
+  "PP": 294,
+  "FF": 194,
+  "TH": 356,
+  "DD": 476,
+  "SS": 531,
+  "CH": 126,
+  "KK": 297,
+  "RR": 415,
+  "aa": 492,
+  "E": 473,
+  "ih": 483,
+  "oh": 474,
+  "ou": 477
+ },
+ "images": {
+  "sil": "sil.jpg",
+  "PP": "PP.jpg",
+  "FF": "FF.jpg",
+  "TH": "TH.jpg",
+  "DD": "DD.jpg",
+  "SS": "SS.jpg",
+  "CH": "CH.jpg",
+  "KK": "KK.jpg",
+  "RR": "RR.jpg",
+  "aa": "aa.jpg",
+  "E": "E.jpg",
+  "ih": "ih.jpg",
+  "oh": "oh.jpg",
+  "ou": "ou.jpg"
+ }
+}

@@ -197,8 +197,11 @@ short talking-head video:
     --picks tools/picks.avatar1.json --out web/avatar --size 512
 ```
 
-`tools/picks.avatar1.json` is the mapping used for the bundled example. Reload
-the page and the photo appears; delete `web/avatar/` to go back to the drawing.
+The bundled `web/avatar/` sprites are committed — 200 KB for the whole face, so a
+clone shows the photo avatar straight away. `tools/picks.avatar1.json` is the
+mapping they were built from. Delete `web/avatar/` to go back to the drawing, or
+rebuild from your own clip with the two commands above; the source video itself
+stays out of the repo.
 
 Three things make this look like one person rather than a flickering slideshow:
 
@@ -217,8 +220,8 @@ Three things make this look like one person rather than a flickering slideshow:
   browser applies the same feathered ellipse the builder used (verified to agree
   within 0.4 % per pixel), so the composite is identical either way.
 
-Both the sprites and the source video stay out of git: `web/avatar/` is
-generated, so a fresh clone shows the drawn face until you build your own.
+The source clip stays out of git; the sprites built from it are committed, so
+the photo avatar works from a clone with no extra steps.
 
 ## Verify (no microphone needed)
 
@@ -299,7 +302,7 @@ virtualtutor/
 │   ├── index.html
 │   ├── styles.css
 │   ├── app.js
-│   └── avatar/             # generated photo sprites (gitignored)
+│   └── avatar/             # photo sprites (committed, ~200 KB)
 └── src/
     ├── config.py
     ├── tts.py
