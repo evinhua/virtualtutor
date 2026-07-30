@@ -24,8 +24,9 @@ VAD_PREROLL_DURATION = 0.4   # seconds of audio kept *before* speech is detected
 # Options (Apple Silicon MLX community models):
 #   mlx-community/whisper-base.en-mlx   (fast, English only)
 #   mlx-community/whisper-small.en-mlx
+#   mlx-community/whisper-small-mlx     (multilingual: auto-detects language)
 #   mlx-community/whisper-medium-mlx    (multilingual, best quality on 32GB+)
-WHISPER_MODEL = os.environ.get("VT_WHISPER_MODEL", "mlx-community/whisper-small.en-mlx")
+WHISPER_MODEL = os.environ.get("VT_WHISPER_MODEL", "mlx-community/whisper-small-mlx")
 
 # --- Anti-hallucination -----------------------------------------------------
 # Whisper invents stock phrases ("Thank you", "Thanks for watching", ...) when
@@ -56,7 +57,10 @@ BASE_SYSTEM_PROMPT = (
     "Keep spoken answers short: 1-3 sentences, no markdown, no lists, no code blocks, "
     "no emojis. Use plain conversational language suitable for text-to-speech. "
     "If the student seems confused, offer a simpler explanation or an analogy. "
-    "Ask a brief follow-up question to check understanding when helpful."
+    "Ask a brief follow-up question to check understanding when helpful. "
+    "Always reply in the same language the student uses. If the student speaks "
+    "Spanish, reply in Spanish. If they speak Chinese, reply in Chinese. "
+    "Match their language naturally without commenting on the switch."
 )
 
 # ---------------------------------------------------------------------------
@@ -151,6 +155,18 @@ TTS_SAMPLE_RATE = 24000      # Kokoro outputs 24 kHz audio
 # Kokoro language pipeline: 'a' = American English, 'b' = British English.
 # Also selects which misaki G2P is used, which the viseme timeline depends on.
 TTS_LANG_CODE = os.environ.get("VT_TTS_LANG", "a")
+
+# ---------------------------------------------------------------------------
+# Multilingual support
+# ---------------------------------------------------------------------------
+# Mapping from Whisper's detected language code to Kokoro pipeline code and
+# a default voice for that language.  The first entry is the fallback.
+LANGUAGE_MAP = {
+    "en": {"kokoro_lang": "a", "voice": os.environ.get("VT_TTS_VOICE", "af_heart")},
+    "es": {"kokoro_lang": "e", "voice": os.environ.get("VT_TTS_VOICE_ES", "ef_dora")},
+    "zh": {"kokoro_lang": "z", "voice": os.environ.get("VT_TTS_VOICE_ZH", "zf_xiaoxiao")},
+}
+DEFAULT_LANGUAGE = "en"  # fallback when detection is uncertain
 
 # ---------------------------------------------------------------------------
 # Behaviour

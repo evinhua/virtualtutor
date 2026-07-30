@@ -19,9 +19,9 @@ fully local operation possible.
 | Stage | Technology | Rationale |
 |-------|-----------|-----------|
 | VAD (voice activity detection) | Silero VAD v5 (`silero-vad`, via `torch`) | Accurate, lightweight, fully offline end-of-speech detection at 16 kHz. |
-| STT (speech-to-text) | `mlx-whisper` — `whisper-small.en` | Metal-accelerated Whisper on Apple Silicon; small.en balances speed and accuracy for English. |
+| STT (speech-to-text) | `mlx-whisper` — `whisper-small` (multilingual) | Metal-accelerated Whisper on Apple Silicon; multilingual model auto-detects English, Spanish and Chinese. |
 | LLM | `llama.cpp` server + Qwen2.5-7B-Instruct Q4_K_M (GGUF) | OpenAI-compatible streaming endpoint, strong 7B instruct model that fits comfortably in memory at Q4_K_M. |
-| TTS (text-to-speech) | Kokoro-82M via `mlx-audio` (voice `af_heart`, 24 kHz) | Small, natural-sounding, Metal-accelerated local TTS. |
+| TTS (text-to-speech) | Kokoro-82M via `mlx-audio` (24 kHz, multilingual) | Small, natural-sounding, Metal-accelerated local TTS with voices for English (`af_heart`), Spanish (`ef_dora`), and Chinese (`zf_xiaoxiao`). |
 | Lip-sync | Kokoro's own duration predictor (`src/visemes.py`) | The frame count per phoneme falls out of the normal forward pass, so a frame-accurate viseme timeline costs no extra inference and no audio analysis. |
 | Frontend | Python stdlib `ThreadingHTTPServer` + Server-Sent Events, static HTML/CSS/JS | A control surface and transcript view with zero added dependencies and no build step. Audio stays in Python, which preserves the half-duplex echo handling. |
 
@@ -60,7 +60,7 @@ fully local operation possible.
 - **`soundfile`** — WAV read/write for the verification script.
 - **`torch`** — backend required by Silero VAD.
 - **`requests`** — streaming HTTP client for the llama.cpp OpenAI-compatible API.
-- **`misaki[en]`** — grapheme-to-phoneme text processing required by Kokoro.
+- **`misaki[en]`, `misaki[zh]`** — grapheme-to-phoneme text processing required by Kokoro for English and Chinese.
 - **`espeak-ng`, `ffmpeg`** — system dependencies (installed via Homebrew).
 - **spaCy `en_core_web_sm`** — downloaded on first run for text processing.
 
@@ -109,8 +109,9 @@ fully local operation possible.
 ## Configuration & deployment
 
 - **Configuration:** centralized in `src/config.py`, every value overridable via
-  `VT_*` environment variables (models, voice, TTS language, persona, barge-in,
-  LLM URL, web host/port).
+  `VT_*` environment variables (models, voice, TTS language, per-language voices,
+  persona, barge-in, LLM URL, web host/port). Multilingual voices can be
+  overridden per language (`VT_TTS_VOICE_ES`, `VT_TTS_VOICE_ZH`).
 - **Deployment model:** local single-user. Both the llama.cpp server and the web
   UI bind to `127.0.0.1` only, with **no authentication** — anyone who can reach
   the web UI could start the microphone, so it must not be exposed to a network

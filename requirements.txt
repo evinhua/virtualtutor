@@ -8,3 +8,4 @@ silero-vad         # voice activity detection (v5)
 mlx-whisper        # Metal-accelerated speech-to-text
 mlx-audio          # Metal-accelerated Kokoro text-to-speech
 misaki[en]         # G2P text processing required by Kokoro
+misaki[zh]         # G2P for Chinese TTS support

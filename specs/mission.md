@@ -47,6 +47,9 @@ memory for responsive, natural back-and-forth conversation.
   moving smoothly rather than snapping between shapes.
 - **A personality you can change** — personas are part of the tutor's identity,
   selectable at startup and switchable mid-conversation.
+- **Multilingual without configuration** — speak English, Spanish or Chinese and
+  the tutor detects the language, replies in it, and speaks it back with the
+  correct voice and lip-sync.
 - **Start and stop are dependable** — a session can be stopped and restarted at
   any moment, including mid-reply, without a stuck thread or a stale persona.
 - **Runs within 36 GB** unified memory on an Apple M3 Pro with all models loaded

@@ -30,7 +30,7 @@ from tts import KokoroTTS
 # ---------------------------------------------------------------------------
 raw_q: "queue.Queue[np.ndarray]" = queue.Queue()      # 512-sample mic frames
 utterance_q: "queue.Queue[np.ndarray]" = queue.Queue()  # complete user utterances
-speak_q: "queue.Queue[str]" = queue.Queue()             # sentences to speak aloud
+speak_q: "queue.Queue[tuple[str, str]]" = queue.Queue()  # (sentence, lang) to speak aloud
 audio_q: "queue.Queue[tuple]" = queue.Queue()            # (audio, viseme timeline) ready to play
 
 stop_event = threading.Event()          # global shutdown
@@ -59,6 +59,9 @@ conversation = [{"role": "system", "content": config.SYSTEM_PROMPT}]
 # Persona currently in force. Kept here (not just in the system prompt) so the
 # CLI, the web UI and the transcript can all label replies correctly.
 active_persona = config.PERSONA
+# Last language the LLM replied in. Used to detect language switches and inject
+# a hint so the model follows the new language despite history in the old one.
+_last_llm_lang = config.DEFAULT_LANGUAGE
 # History is trimmed in blocks rather than every turn. Dropping the oldest
 # message each turn changes the token prefix after the system prompt, which
 # invalidates llama.cpp's KV cache and forces a full re-prefill of the whole
@@ -267,8 +270,11 @@ def next_sentence(buffer: str):
     return buffer[: m.end()].strip(), buffer[m.end():]
 
 
-def transcribe(audio: np.ndarray) -> str:
+def transcribe(audio: np.ndarray) -> tuple[str, str]:
     """Transcribe an utterance, guarding against Whisper hallucinations.
+
+    Returns (text, language) where language is a Whisper language code like
+    'en', 'es', 'zh'. Falls back to config.DEFAULT_LANGUAGE on failure.
 
     Whisper fabricates stock phrases ("Thank you", "Thanks for watching") when
     given near-silence or noise. We defend in three layers: an energy gate, the
@@ -280,7 +286,7 @@ def transcribe(audio: np.ndarray) -> str:
     rms = utterance_rms(audio)
     if rms < config.STT_MIN_RMS:
         print(f"[STT] skipped near-silence (rms={rms:.4f})")
-        return ""
+        return "", config.DEFAULT_LANGUAGE
 
     # Robust decoding: greedy, no cross-segment priming (a hallucination amplifier).
     result = mlx_whisper.transcribe(
@@ -293,24 +299,57 @@ def transcribe(audio: np.ndarray) -> str:
         compression_ratio_threshold=2.4,
     )
 
+    # Extract detected language (multilingual Whisper returns this).
+    detected_lang = result.get("language", config.DEFAULT_LANGUAGE)
+    # Normalize: Whisper may return full name or code depending on version.
+    if detected_lang and len(detected_lang) > 3:
+        # e.g. "english" -> "en", "spanish" -> "es", "chinese" -> "zh"
+        _LANG_NAMES = {"english": "en", "spanish": "es", "chinese": "zh",
+                       "mandarin": "zh"}
+        detected_lang = _LANG_NAMES.get(detected_lang.lower(), detected_lang[:2])
+    # Only support configured languages; fall back for unsupported ones.
+    if detected_lang not in config.LANGUAGE_MAP:
+        detected_lang = config.DEFAULT_LANGUAGE
+
     # Layer 2: trust Whisper's own scores, but only to reject a WHOLE utterance
     # that is entirely non-speech (see has_real_speech).
     if not has_real_speech(result.get("segments")):
         print("[STT] rejected: entire utterance flagged non-speech/low-confidence")
-        return ""
+        return "", detected_lang
     text = result.get("text", "").strip()
 
     # Layer 3: blocklist of known hallucinated fillers.
     if is_hallucination(text):
         print(f"[STT] rejected hallucination: {text!r}")
-        return ""
+        return "", detected_lang
 
-    return text
+    return text, detected_lang
 
 
-def stream_llm(prompt: str):
-    """Stream the LLM reply, yielding complete sentences for TTS."""
+def stream_llm(prompt: str, lang: str = config.DEFAULT_LANGUAGE):
+    """Stream the LLM reply, yielding complete sentences for TTS.
+
+    When the detected language differs from the previous turn, a brief system
+    hint is injected so the model switches language even when the history is
+    predominantly in a different one. The hint is ephemeral: it is removed
+    after the reply so it does not accumulate in history.
+    """
+    global _last_llm_lang
     conversation.append({"role": "user", "content": prompt})
+
+    # Inject a language-switch hint if the student changed language.
+    lang_hint = None
+    if lang != _last_llm_lang:
+        lang_names = {"en": "English", "es": "Spanish", "zh": "Chinese"}
+        lang_name = lang_names.get(lang, lang)
+        lang_hint = {
+            "role": "system",
+            "content": f"The student is now speaking {lang_name}. "
+                       f"Reply in {lang_name} from now on."
+        }
+        conversation.append(lang_hint)
+    _last_llm_lang = lang
+
     payload = {
         "messages": conversation,
         "stream": True,
@@ -326,7 +365,10 @@ def stream_llm(prompt: str):
         print(f"\n[LLM] cannot reach llama-server: {e}")
         emit("error", text="Cannot reach the language model server. "
                            "Start it with ./scripts/start_server.sh")
-        conversation.pop()  # roll back the user turn
+        # Roll back: remove hint and user turn.
+        if lang_hint:
+            conversation.remove(lang_hint)
+        conversation.pop()
         return
 
     for line in resp.iter_lines():
@@ -355,6 +397,12 @@ def stream_llm(prompt: str):
     print()
     if sentence.strip() and not interrupt_event.is_set():
         yield sentence.strip()
+
+    # Remove the ephemeral hint before storing the assistant reply, so it does
+    # not pollute the permanent history (it served its purpose for this turn).
+    if lang_hint and lang_hint in conversation:
+        conversation.remove(lang_hint)
+
     if full_reply.strip():
         conversation.append({"role": "assistant", "content": full_reply.strip()})
     emit("assistant_done")
@@ -385,7 +433,7 @@ def brain_worker(gen: int):
             continue
 
         interrupt_event.clear()
-        text = transcribe(audio)
+        text, detected_lang = transcribe(audio)
         # Transcription takes a second or two, in which the user may have
         # pressed Stop or switched session; do not start a reply into the void.
         if not session_active(gen):
@@ -393,12 +441,12 @@ def brain_worker(gen: int):
         if not text:
             emit("state", state="listening")
             continue
-        print(f"\n[You]: {text}")
+        print(f"\n[You ({detected_lang})]: {text}")
         emit("user", text=text)
-        for sentence in stream_llm(text):
+        for sentence in stream_llm(text, lang=detected_lang):
             if interrupt_event.is_set() or not session_active(gen):
                 break
-            speak_q.put(sentence)
+            speak_q.put((sentence, detected_lang))
 
 
 # ---------------------------------------------------------------------------
@@ -442,16 +490,18 @@ def synth_worker(tts: KokoroTTS, gen: int):
     """
     while session_active(gen):
         try:
-            text = speak_q.get(timeout=0.2)
+            item = speak_q.get(timeout=0.2)
         except queue.Empty:
             continue
         if interrupt_event.is_set():
             continue
+        # Unpack (sentence, language)
+        text, lang = item
         # synth_busy stays set until the audio is queued, so the player never
         # sees "both queues empty" while a sentence is still being produced.
         synth_busy.set()
         try:
-            audio, timeline = tts.synthesize_with_visemes(text)
+            audio, timeline = tts.synthesize_with_visemes(text, lang=lang)
             if audio.size and not interrupt_event.is_set():
                 audio_q.put((audio, timeline))
         except Exception as e:
@@ -615,7 +665,9 @@ def start_pipeline(persona_key: str = config.DEFAULT_PERSONA, reset_history: boo
 
         set_persona(persona_key)
         if reset_history:
+            global _last_llm_lang
             del conversation[1:]
+            _last_llm_lang = config.DEFAULT_LANGUAGE
 
         tts = load_tts()
         _threads = [

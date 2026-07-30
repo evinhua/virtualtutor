@@ -61,8 +61,14 @@ Improve the tutoring experience itself.
 Widen who and how VirtualTutor can serve.
 
 - Multilingual STT/TTS support (whisper multilingual + non-English Kokoro voices).
-  *(Groundwork: `VT_TTS_LANG` selects the Kokoro pipeline, and the viseme map
-  covers IPA beyond US English.)*
+  *(Delivered: Whisper multilingual auto-detects the spoken language, and the
+  detected language routes through the pipeline to select the correct Kokoro
+  pipeline and voice. Supported languages: English (`af_heart`), Spanish
+  (`ef_dora`), and Chinese (`zf_xiaoxiao`). The LLM replies in the same language
+  the student uses. All phonemes produced by the Spanish and Chinese G2P are
+  already covered by the viseme map, so lip-sync works across all three
+  languages. Per-language voices are overridable via `VT_TTS_VOICE_ES` and
+  `VT_TTS_VOICE_ZH`.)*
 - Selectable quality tiers (small/medium Whisper, 7B/14B LLM) with guidance on
   memory tradeoffs.
 - Optional lightweight UI (transcript view, push-to-talk, voice/model pickers).

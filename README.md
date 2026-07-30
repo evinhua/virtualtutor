@@ -2,12 +2,13 @@
 
 A continuous, real-time **voice conversation** tutor that runs fully on-device on
 Apple Silicon. Speak to it, it thinks, and it talks back — with barge-in so you
-can interrupt it any time.
+can interrupt it any time. Supports **English**, **Spanish**, and **Chinese**
+with automatic language detection.
 
 ```
 Microphone ─PCM─▶ Silero VAD ─audio─▶ mlx-whisper ─text─▶ llama.cpp (Qwen2.5-7B)
                   (speech end)         (STT)                    │ token stream
-                                                                ▼
+                                        │ lang detect           ▼
 Speakers ◀─PCM─ Kokoro TTS ◀─sentences─ sentence-split buffer ◀─┘
                      │ phoneme durations
                      └──▶ viseme timeline ──▶ browser (lip-synced avatar)
@@ -21,9 +22,9 @@ Tested on **Apple M3 Pro / 36 GB / macOS**.
 | Stage | Tech | Notes |
 |-------|------|-------|
 | VAD   | Silero VAD v5 (`silero-vad`) | detects end of speech, offline |
-| STT   | `mlx-whisper` (`whisper-small.en`) | Metal-accelerated transcription |
+| STT   | `mlx-whisper` (`whisper-small`, multilingual) | Metal-accelerated transcription, auto-detects language |
 | LLM   | `llama.cpp` server + Qwen2.5-7B-Instruct Q4_K_M | OpenAI-compatible, streaming |
-| TTS   | Kokoro-82M via `mlx-audio` | 24 kHz, voice `af_heart` |
+| TTS   | Kokoro-82M via `mlx-audio` | 24 kHz, multilingual (EN/ES/ZH) |
 | Lip-sync | Kokoro's own phoneme durations | no second model, frame-accurate |
 | UI    | stdlib HTTP + SSE, static HTML/CSS/JS | optional; CLI works alone |
 
@@ -96,6 +97,26 @@ running** — switching rewrites the system prompt in place, so the next reply
 changes personality and the conversation so far is kept.
 
 Quit with `Ctrl+C`.
+
+### Multilingual
+
+VirtualTutor automatically detects and responds in **English**, **Spanish**, and
+**Chinese**. Just speak in your language — no configuration needed.
+
+| Language | Whisper detection | Kokoro voice | Pipeline |
+|----------|------------------|--------------|----------|
+| English  | `en` (automatic) | `af_heart`   | `a` (US) |
+| Spanish  | `es` (automatic) | `ef_dora`    | `e`      |
+| Chinese  | `zh` (automatic) | `zf_xiaoxiao`| `z`      |
+
+How it works:
+1. Multilingual Whisper transcribes your speech and detects which language you're speaking.
+2. The LLM replies in the same language.
+3. Kokoro TTS synthesizes the reply using the language-appropriate voice and G2P pipeline.
+4. Lip-sync visemes work for all three languages — the phoneme-to-mouth-shape mapping covers Spanish and Chinese IPA.
+
+Language switching is seamless: speak Spanish mid-conversation and the tutor
+switches to Spanish on its next reply.
 
 ## Web UI
 
@@ -254,9 +275,11 @@ Everything is in `src/config.py` and can be overridden with env vars:
 
 | Env var | Default | Purpose |
 |---------|---------|---------|
-| `VT_WHISPER_MODEL` | `mlx-community/whisper-small.en-mlx` | STT model |
+| `VT_WHISPER_MODEL` | `mlx-community/whisper-small-mlx` | STT model (multilingual) |
 | `VT_TTS_MODEL` | `prince-canuma/Kokoro-82M` | TTS model |
-| `VT_TTS_VOICE` | `af_heart` | Kokoro voice (af_bella, am_adam, bf_emma, ...) |
+| `VT_TTS_VOICE` | `af_heart` | Kokoro voice for English |
+| `VT_TTS_VOICE_ES` | `ef_dora` | Kokoro voice for Spanish |
+| `VT_TTS_VOICE_ZH` | `zf_xiaoxiao` | Kokoro voice for Chinese |
 | `VT_LLAMA_URL` | `http://localhost:8080/v1/chat/completions` | LLM endpoint |
 | `VT_MODEL_FILE` | `Qwen2.5-7B-Instruct-Q4_K_M.gguf` | GGUF filename |
 | `VT_PERSONA` | `tutor` | tutor personality: `tutor`, `jester`, `cheerleader`, `explorer` |
