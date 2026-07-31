@@ -39,9 +39,14 @@ memory for responsive, natural back-and-forth conversation.
   beyond the local HTTP endpoint.
 - **Low perceived latency** — the tutor begins speaking as soon as the first
   sentence is ready, not after the full reply is generated.
-- **Natural turn-taking** — reliable end-of-speech detection (~0.8 s pause) and
-  optional barge-in to interrupt the tutor mid-sentence.
+- **Natural turn-taking** — reliable end-of-speech detection (~0.8 s pause), and
+  optional barge-in that a short interjection is enough to trigger and that keeps
+  the words you interrupted with, instead of stopping the tutor and then having
+  nothing to answer.
 - **Clean transcription** — no hallucinated filler phrases reaching the LLM.
+- **Settings you can change while talking** — the voice for each language applies
+  from the tutor's next sentence and the duplex mode from the next mic frame, with
+  no restart and no lost conversation.
 - **A face that matches the voice** — lip-sync driven by the actual phonemes
   being spoken, accurate to the millisecond, with no additional model, and
   moving smoothly rather than snapping between shapes.
@@ -69,16 +74,20 @@ memory for responsive, natural back-and-forth conversation.
 - **Conversational, spoken-first output** — short, plain-language replies suited
   to text-to-speech, never markdown or code blocks.
 - **Configurable, not hardcoded** — every model and behavior knob is overridable
-  via environment variables.
+  via environment variables, and the settings worth changing mid-conversation are
+  read where they are used rather than captured at startup, so a dialog can change
+  them live without a restart or a second copy of the state.
 - **Reuse what the models already compute** — the mouth is animated from
   Kokoro's own duration predictor rather than a second model, and the avatar is
   aligned with the tensor library already in the dependency list.
 - **No dependency the feature does not need** — the UI is stdlib HTTP and static
   files, with no framework, bundler, or build step.
 - **The fragile logic is tested** — timeline construction, sentence splitting,
-  transcription guards, history trimming, persona switching and the HTTP layer
-  are covered by fast tests that need no models, and a fix for a reported bug
-  starts by reproducing it.
-- **Claims are measured** — smoothness, alignment quality and asset size are
-  reported as numbers rather than adjectives, so a change can be shown to be an
-  improvement.
+  transcription guards, history trimming, persona switching, runtime settings, the
+  barge-in decision and the HTTP layer are covered by fast tests that need no
+  models, and a fix for a reported bug starts by reproducing it. Where the bug is
+  in audio behavior, the reproduction drives the real worker through a fake
+  microphone rather than a mocked one.
+- **Claims are measured** — smoothness, alignment quality, asset size and how long
+  an interruption takes to register are reported as numbers rather than
+  adjectives, so a change can be shown to be an improvement.

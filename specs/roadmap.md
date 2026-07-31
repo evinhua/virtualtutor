@@ -12,6 +12,10 @@ The current working pipeline.
   first word is not clipped.
 - Streaming LLM replies split into sentences and spoken as they arrive.
 - Half-duplex playback with echo flushing; opt-in barge-in for headphones.
+  *(Barge-in was reworked after it was reported as not interrupting at all: the
+  gate required consecutive loud frames, which short interjections never produce,
+  and a successful interruption discarded the words that caused it. Now scored
+  with decay, and the interrupting audio seeds the new utterance.)*
 - Anti-hallucination guards for STT (energy gate, confidence scores, phrase
   blocklist).
 - Central env-var-driven configuration (`config.py`).
@@ -30,10 +34,10 @@ Make the existing experience reliable and easy to adopt.
   unwind silently, and the web server explains a busy port rather than dumping a
   traceback. Logging levels are still open.)*
 - Automated tests for the STT hallucination filters and sentence-splitting.
-  *(Delivered: `tests/` runs 137 tests in about two seconds, without loading
+  *(Delivered: `tests/` runs 171 tests in about two seconds, without loading
   models or opening audio devices — also covering the viseme timeline, history
-  trimming, persona switching, the HTTP layer over a real socket, and the avatar
-  asset contract.)*
+  trimming, persona switching, runtime settings, the barge-in decision, the HTTP
+  layer over a real socket, and the avatar asset contract.)*
 - A single launcher that starts the LLM server and agent together.
   *(Delivered: `scripts/start_all.sh`.)*
 - Device selection / listing for input and output audio devices.
@@ -52,6 +56,11 @@ Improve the tutoring experience itself.
   identifies itself by persona when asked.)*
 - Smarter history management (token-aware trimming, summarization of old turns).
 - Interruption-aware context so barge-in edits the ongoing turn cleanly.
+  *(Half delivered: the interrupting utterance is now captured in full instead of
+  being dropped, so the tutor answers what you actually said. The interrupted
+  reply is still stored in history exactly as far as the LLM streamed it, which
+  can include a sentence that was synthesized but never heard — trimming history
+  to what was actually spoken is still open.)*
 - Latency instrumentation (per-stage timing) surfaced for tuning.
 
 **Depends on:** Phase 1.
@@ -68,7 +77,7 @@ Widen who and how VirtualTutor can serve.
   the student uses. All phonemes produced by the Spanish and Chinese G2P are
   already covered by the viseme map, so lip-sync works across all three
   languages. Per-language voices are overridable via `VT_TTS_VOICE_ES` and
-  `VT_TTS_VOICE_ZH`.)*
+  `VT_TTS_VOICE_ZH`, or changed mid-session from the Configuration dialog.)*
 - Selectable quality tiers (small/medium Whisper, 7B/14B LLM) with guidance on
   memory tradeoffs.
 - Optional lightweight UI (transcript view, push-to-talk, voice/model pickers).
@@ -76,9 +85,14 @@ Widen who and how VirtualTutor can serve.
   persona picker that works mid-session, and a lip-synced avatar — either a
   drawn face or a photo one, whose mouth blends the strongest visemes so motion
   stays smooth. The bundled sprites are committed, so a clone shows the photo
-  face. Push-to-talk and voice/model pickers are still open.)*
+  face. A Configuration dialog picks the voice per language and switches duplex
+  mode, both applying immediately. Push-to-talk and a model picker are still
+  open — a model change means reloading weights, which is not a live setting.)*
 - Full-duplex mode with software echo cancellation for speaker use without
   headphones.
+  *(Full duplex itself is delivered and switchable from the Configuration dialog,
+  but it still relies on an RMS gate and therefore on headphones. Echo
+  cancellation — the part that would make speakers usable — is open.)*
 
 **Depends on:** Phase 2.
 

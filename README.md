@@ -1,8 +1,8 @@
 # VirtualTutor 🎓
 
 A continuous, real-time **voice conversation** tutor that runs fully on-device on
-Apple Silicon. Speak to it, it thinks, and it talks back — with barge-in so you
-can interrupt it any time. Supports **English**, **Spanish**, and **Chinese**
+Apple Silicon. Speak to it, it thinks, and it talks back — and in full duplex you
+can cut it off mid-sentence. Supports **English**, **Spanish**, and **Chinese**
 with automatic language detection.
 
 ```
@@ -21,10 +21,10 @@ Tested on **Apple M3 Pro / 36 GB / macOS**.
 
 | Stage | Tech | Notes |
 |-------|------|-------|
-| VAD   | Silero VAD v5 (`silero-vad`) | detects end of speech, offline |
+| VAD   | Silero VAD v5 (`silero-vad`) | detects end of speech and barge-in, offline |
 | STT   | `mlx-whisper` (`whisper-small`, multilingual) | Metal-accelerated transcription, auto-detects language |
 | LLM   | `llama.cpp` server + Qwen2.5-7B-Instruct Q4_K_M | OpenAI-compatible, streaming |
-| TTS   | Kokoro-82M via `mlx-audio` | 24 kHz, multilingual (EN/ES/ZH) |
+| TTS   | Kokoro-82M via `mlx-audio` | 24 kHz, multilingual (EN/ES/ZH), voice switchable live |
 | Lip-sync | Kokoro's own phoneme durations | no second model, frame-accurate |
 | UI    | stdlib HTTP + SSE, static HTML/CSS/JS | optional; CLI works alone |
 
@@ -77,7 +77,8 @@ Open two terminals:
 Then just talk. Pause for ~0.8 s and the tutor replies. By default it runs
 **half-duplex** (it doesn't listen while speaking) to avoid the speaker echoing
 into the mic. If you use headphones you can enable interrupting the tutor mid-
-sentence with `VT_BARGE_IN=1 ./scripts/start_agent.sh`.
+sentence with `VT_BARGE_IN=1 ./scripts/start_agent.sh` — see
+[Barge-in](#barge-in).
 
 On startup the agent asks you to pick a **tutor persona** (personality). Choose
 by number, or press Enter for the default. You can skip the menu by presetting
@@ -103,11 +104,14 @@ Quit with `Ctrl+C`.
 VirtualTutor automatically detects and responds in **English**, **Spanish**, and
 **Chinese**. Just speak in your language — no configuration needed.
 
-| Language | Whisper detection | Kokoro voice | Pipeline |
-|----------|------------------|--------------|----------|
+| Language | Whisper detection | Default Kokoro voice | Pipeline |
+|----------|------------------|----------------------|----------|
 | English  | `en` (automatic) | `af_heart`   | `a` (US) |
 | Spanish  | `es` (automatic) | `ef_dora`    | `e`      |
 | Chinese  | `zh` (automatic) | `zf_xiaoxiao`| `z`      |
+
+Each language's voice can be changed while a session runs — see
+[Configuration dialog](#configuration-dialog).
 
 How it works:
 1. Multilingual Whisper transcribes your speech and detects which language you're speaking.
@@ -121,9 +125,9 @@ switches to Spanish on its next reply.
 ## Web UI
 
 A local web frontend is available as an alternative to the terminal: one
-start/stop button, a live transcript, a lip-synced avatar, and an animated
-background whose colours and wave shapes follow the conversation state and your
-voice level.
+start/stop button, a live transcript, a lip-synced avatar, a Configuration dialog
+for voices and duplex mode, and an animated background whose colours and wave
+shapes follow the conversation state and your voice level.
 
 ```bash
 # Terminal 1 — LLM server
@@ -142,9 +146,11 @@ transcript view. The server is built on the Python standard library
 |----------|---------|
 | `GET /api/personas` | available personas (key, name, blurb) |
 | `GET /api/status` | whether a session is live, and the active persona |
+| `GET /api/config` | voices offered per language, plus the duplex mode |
 | `GET /api/events` | SSE stream: state, transcript, mic level, visemes |
 | `POST /api/start` | start listening — body `{"persona": "tutor"}` |
 | `POST /api/persona` | switch persona, mid-session if one is running |
+| `POST /api/config` | set voices / duplex mode — body `{"voices": {"en": "bf_emma"}, "duplex": "full"}` |
 | `POST /api/stop` | stop listening |
 
 | Env var | Default | Purpose |
@@ -155,6 +161,62 @@ transcript view. The server is built on the Python standard library
 **Security:** like the LLM server, the web UI binds to `127.0.0.1` and has **no
 authentication**. Anyone who can reach it can start your microphone, so do not
 bind it to `0.0.0.0` or expose it to a network without adding access control.
+
+### Configuration dialog
+
+The **Configuration** button in the panel header opens a dialog with the two
+settings worth changing without a restart:
+
+- **Voices** — one dropdown per language (English, Spanish, Chinese) listing the
+  Kokoro voices for that language. English offers both American (`af_*`, `am_*`)
+  and British (`bf_*`, `bm_*`) speakers; picking a British voice switches the G2P
+  pipeline to `b` as well, since a British voice read with American
+  pronunciation is worse than either on its own.
+- **Duplex mode** — a switch between half duplex (default: the mic is muted while
+  the tutor speaks) and full duplex (keep listening, so you can interrupt it).
+  Full duplex is the same thing as `VT_BARGE_IN=1` and wants headphones — see
+  [Barge-in](#barge-in) for what interrupting actually does.
+
+There is no Save button because there is nothing to save: the voice is resolved
+per synthesized sentence and the duplex mode is read on every mic frame, so both
+apply immediately — mid-session included. A voice change lands on the tutor's
+next sentence; one already synthesized keeps the old voice. Changes are
+broadcast over the SSE stream, so a second browser tab does not go stale.
+
+The dialog is populated from `/api/config`, which reads `AVAILABLE_VOICES` in
+`src/config.py` — that file stays the only place the voice list is defined. A
+voice picked for the first time is downloaded from Hugging Face (a few hundred
+KB); after that it is cached like every other model.
+
+### Barge-in
+
+In full duplex the mic stays open while the tutor talks, and speaking over it
+stops it mid-sentence. Two details decide whether that feels right:
+
+**How much speech counts as an interruption.** Not one loud frame — a keypress
+or a door would stop the tutor. But not an unbroken run of loud frames either,
+which is what this used to require: speech dips below the threshold between
+words and on plosives, and every dip restarted the count. Measured on
+synthesized speech at a normal speaking level, that never fired *at all* for
+`"Stop."` or `"Wait!"`, and took 1.66 s on a whole sentence — long enough that
+the tutor talked over you and you gave up. So evidence now accumulates and
+*decays* rather than resetting (`BARGE_IN_SPEECH_DURATION`, `BARGE_IN_DECAY`),
+which fires the same four phrases in 0.61–0.83 s while a lone spike still cannot
+reach the threshold before it decays away.
+
+**What happens to the words you interrupted with.** They are kept. The frames
+leading up to the interruption seed the new utterance
+(`BARGE_IN_PREROLL_DURATION`, 1.2 s — longer than the 0.4 s pre-roll used for a
+normal speech onset, because confirming a barge-in takes up to ~0.85 s). Before,
+they were discarded along with the echo flush, so `"Wait, stop, I do not
+understand"` reached the STT as `"I do not understand"` at best — and a short
+`"Stop."` left nothing above the minimum utterance length, so the tutor went
+quiet and never answered.
+
+The one thing no frame-level heuristic can do is tell your voice from the
+tutor's own voice coming back through a speaker at the same level. That is what
+`BARGE_IN_MIN_RMS` guards, and why full duplex asks for headphones: echo quieter
+than the gate is ignored, echo louder than it interrupts the tutor with itself.
 
 ### Lip-sync
 
@@ -200,7 +262,7 @@ timeline could drive a 3D VRM avatar instead of the 2D canvas mouth.
 
 | Env var | Default | Purpose |
 |---------|---------|---------|
-| `VT_TTS_LANG` | `a` | Kokoro language pipeline: `a` US English, `b` UK English |
+| `VT_TTS_LANG` | `a` | fallback Kokoro pipeline (`a` US English, `b` UK English) for a voice whose name does not imply one |
 
 ### Photo avatar
 
@@ -257,9 +319,12 @@ reachability.
 
 Unit tests cover the pure logic that is easy to break and hard to notice: the
 viseme timeline, the sentence splitter feeding TTS, the Whisper
-anti-hallucination guards, history trimming, persona prompts and switching, and
-the photo avatar's asset contract. They load no models and open no audio
-devices, so the suite (127 tests) runs in about a second.
+anti-hallucination guards, history trimming, persona prompts and switching, the
+runtime settings behind the Configuration dialog (voice per language, the
+pipeline each voice implies, duplex mode), the barge-in decision and the photo
+avatar's asset contract. They load no models and open no audio devices, so the
+suite (171 tests) runs in
+about two seconds.
 
 ```bash
 ./.venv/bin/pip install -r requirements-dev.txt   # once
@@ -294,9 +359,11 @@ and use a 14B `Q5_K_M` GGUF for the LLM.
   has no auth — it is intended for local single-user use.
 - Runs half-duplex by default (does not listen while speaking) to prevent the
   speaker echoing into the mic and cutting off replies. Barge-in is opt-in via
-  `VT_BARGE_IN=1` and works best with headphones.
+  `VT_BARGE_IN=1` or the Configuration dialog, and needs headphones.
 - Each utterance is captured with a 0.4 s pre-roll so the first word is not
-  clipped, and echo picked up during playback is flushed before listening resumes.
+  clipped. In half duplex the echo picked up during playback is flushed before
+  listening resumes; in full duplex there is nothing to flush, and the audio
+  leading up to a barge-in is kept so the interrupting words are transcribed.
 - First run downloads model weights (Kokoro, Whisper, spaCy `en_core_web_sm`,
   and the GGUF); subsequent runs are offline except the local HTTP call.
 

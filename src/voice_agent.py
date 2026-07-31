@@ -104,6 +104,29 @@ def set_persona(persona_key: str) -> str:
     return persona_key
 
 
+def set_voice(lang: str, voice: str) -> str:
+    """Change the TTS voice for one language. Returns the voice in force.
+
+    Safe mid-session: tts.py resolves the voice per sentence, so the change
+    lands on the tutor's next sentence without reloading anything. A sentence
+    already synthesized keeps the old voice.
+    """
+    applied = config.set_voice(lang, voice)
+    emit("voice", lang=lang, voice=applied)
+    return applied
+
+
+def set_duplex_mode(mode: str) -> str:
+    """Switch between half and full duplex. Returns the mode in force.
+
+    Full duplex arms barge-in, which needs headphones: on speakers the tutor's
+    own voice re-enters the mic and interrupts it mid-reply.
+    """
+    applied = config.set_duplex_mode(mode)
+    emit("duplex", mode=applied)
+    return applied
+
+
 
 # ---------------------------------------------------------------------------
 # 1. Microphone capture
@@ -117,26 +140,66 @@ def audio_callback(indata, frames, time_info, status):
 # ---------------------------------------------------------------------------
 # 2. Voice Activity Detection
 # ---------------------------------------------------------------------------
+class BargeInDetector:
+    """Decides whether sound picked up during playback is a real interruption.
+
+    Evidence accumulates instead of having to be consecutive. Speech dips below
+    the VAD threshold between words and on plosives, and a consecutive-frame
+    counter starts over on every dip: measured on synthesized speech at a normal
+    speaking level, that counter never fired at all for "Stop." or "Wait!" and
+    took 1.66 s to fire on a whole sentence, so the tutor talked over the user
+    and the interruption was usually missed outright. Scoring with decay fires
+    the same cases in 0.61-0.83 s.
+
+    A lone spike -- a keypress, a door, one loud burst of echo -- still cannot
+    interrupt, because it decays away before reaching the threshold.
+    """
+
+    def __init__(self):
+        self.needed = max(1, int(config.BARGE_IN_SPEECH_DURATION
+                                 * config.SAMPLE_RATE / config.FRAME_SIZE))
+        self.score = 0.0
+        self.fired = False
+
+    def reset(self):
+        self.score = 0.0
+        self.fired = False
+
+    def feed(self, is_speech: bool, rms: float) -> bool:
+        """Add one frame. Returns True once: on the frame that confirms it."""
+        if is_speech and rms >= config.BARGE_IN_MIN_RMS:
+            self.score = min(float(self.needed), self.score + 1.0)
+        else:
+            self.score = max(0.0, self.score - config.BARGE_IN_DECAY)
+        if self.fired or self.score < self.needed:
+            return False
+        self.fired = True
+        return True
+
+
 def vad_worker(gen: int):
     """Detect speech segments and enqueue complete utterances.
 
-    While the assistant is speaking, detected speech triggers barge-in instead
-    of being recorded, so the tutor stops talking and waits for the new query.
+    Half duplex (the default) ignores the mic while the tutor speaks. Full duplex
+    keeps listening, and sustained speech interrupts the tutor: playback stops
+    and the words that caused the interruption start the new utterance, rather
+    than being thrown away with the echo.
     """
     vad = load_silero_vad()
     max_silence = int(config.VAD_SILENCE_DURATION * config.SAMPLE_RATE / config.FRAME_SIZE)
     min_speech = int(config.VAD_MIN_SPEECH_DURATION * config.SAMPLE_RATE / config.FRAME_SIZE)
     preroll_len = max(1, int(config.VAD_PREROLL_DURATION * config.SAMPLE_RATE / config.FRAME_SIZE))
-    # consecutive loud speech frames needed to treat sound as a real interruption
-    barge_in_frames = int(0.4 * config.SAMPLE_RATE / config.FRAME_SIZE)
+    # Enough history to also cover the audio a barge-in takes to confirm.
+    history_len = max(preroll_len, int(config.BARGE_IN_PREROLL_DURATION
+                                       * config.SAMPLE_RATE / config.FRAME_SIZE))
 
     from collections import deque
-    preroll = deque(maxlen=preroll_len)  # recent frames captured before speech starts
+    preroll = deque(maxlen=history_len)  # recent frames captured before speech starts
+    barge = BargeInDetector()
     buffer: list[np.ndarray] = []
     speaking = False
     silence = 0
-    speech_run = 0
-    was_assistant_speaking = False
+    mic_was_muted = False    # half duplex closed the mic while the tutor spoke
     # Emit a mic level roughly 10x/second rather than once per 512-sample frame.
     level_every = max(1, int(config.SAMPLE_RATE / config.FRAME_SIZE / 10))
     level_ticks = 0
@@ -152,53 +215,67 @@ def vad_worker(gen: int):
         except queue.Empty:
             continue
 
-        # When the tutor JUST stopped speaking, discard echo/tail that leaked into
-        # the mic during playback so it is not mistaken for (or merged into) speech.
-        if was_assistant_speaking and not assistant_speaking.is_set():
+        tutor_speaking = assistant_speaking.is_set()
+
+        # --- Half duplex: the mic is closed while the tutor speaks ---------
+        if tutor_speaking and not config.ENABLE_BARGE_IN:
+            mic_was_muted = True
+            continue
+
+        # Echo and the tail of the tutor's own voice leaked in while the mic was
+        # muted; drop it before listening, or it is merged into the next
+        # utterance. Only reachable in half duplex -- in full duplex the mic was
+        # never muted, and flushing would discard the interruption just captured.
+        if mic_was_muted:
             flush_input()
             preroll.clear(); buffer = []
-            speaking = False; silence = 0; speech_run = 0
+            speaking = False; silence = 0
+            barge.reset()
             vad.reset_states()
-            was_assistant_speaking = False
+            mic_was_muted = False
             continue
 
-        # --- While the tutor is speaking: half-duplex, optional barge-in ---
-        if assistant_speaking.is_set():
-            was_assistant_speaking = True
-            if config.ENABLE_BARGE_IN:
-                rms = float(np.sqrt(np.mean(np.square(frame))))
-                prob = vad(torch.from_numpy(frame), config.SAMPLE_RATE).item()
-                if prob >= config.VAD_THRESHOLD and rms >= config.BARGE_IN_MIN_RMS:
-                    speech_run += 1
-                    if speech_run >= barge_in_frames:
-                        print("\n[VAD] barge-in detected -> interrupting tutor")
-                        interrupt_event.set()
-                        drain_queue(speak_q)
-                        drain_queue(audio_q)
-                        emit("interrupted")
-                        speech_run = 0
-                else:
-                    speech_run = 0
-            continue
-
-        # --- Normal listening --------------------------------------------
         preroll.append(frame)
         prob = vad(torch.from_numpy(frame), config.SAMPLE_RATE).item()
         is_speech = prob >= config.VAD_THRESHOLD
+        rms = float(np.sqrt(np.mean(np.square(frame))))
 
-        # Feed the UI a coarse input level (~10 Hz) to drive the background waves.
+        # Feed the UI a coarse input level (~10 Hz) to drive the background
+        # waves. Emitted during playback too, so full duplex visibly shows that
+        # the mic is still open while the tutor talks.
         level_ticks += 1
         if level_ticks >= level_every:
             level_ticks = 0
-            emit("level", value=round(float(np.sqrt(np.mean(np.square(frame)))), 4))
+            emit("level", value=round(rms, 4))
+
+        # --- Full duplex: sustained speech interrupts the tutor ------------
+        if tutor_speaking and not barge.fired:
+            if not barge.feed(is_speech, rms):
+                continue    # not an interruption (yet), so record nothing
+            print("\n[VAD] barge-in detected -> interrupting tutor")
+            interrupt_event.set()
+            drain_queue(speak_q)
+            drain_queue(audio_q)
+            emit("interrupted")
+            # Rewind into the audio that triggered this, so the interrupting
+            # words are transcribed instead of only whatever follows them.
+            speaking = True
+            silence = 0
+            buffer = list(preroll)
+            emit("state", state="hearing")
+            continue
+        if not tutor_speaking:
+            barge.reset()
 
         if is_speech:
             if not speaking:
                 print("\n[VAD] speech detected, listening ...")
                 emit("state", state="hearing")
                 speaking = True
-                # seed with pre-roll so the onset (first word) is not clipped
-                buffer = list(preroll)
+                # Seed with pre-roll so the onset (first word) is not clipped.
+                # Only the normal window: the rest of the deque exists for
+                # barge-in, and would prepend a second of room noise here.
+                buffer = list(preroll)[-preroll_len:]
             else:
                 buffer.append(frame)
             silence = 0
@@ -562,7 +639,9 @@ def speak_worker(tts: KokoroTTS, gen: int):
                 out.abort()
                 playhead = 0.0  # buffer discarded, nothing is queued to be heard
                 assistant_speaking.clear()
-                emit("state", state="listening")
+                # "hearing", not "listening": playback stopped because the user
+                # is mid-sentence, and the VAD is already recording them.
+                emit("state", state="hearing")
                 continue
 
             # Only release the mic once nothing else is coming AND the audio

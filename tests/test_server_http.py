@@ -152,3 +152,69 @@ def test_personas_endpoint_lists_keys_the_ui_can_send(conn):
     assert {p["key"] for p in payload["personas"]} == set(config.PERSONAS)
     for p in payload["personas"]:
         assert p["name"] and p["blurb"]
+
+
+# --- /api/config: the Configuration dialog ---------------------------------
+@pytest.fixture
+def restore_settings():
+    voices = {lang: dict(entry) for lang, entry in config.LANGUAGE_MAP.items()}
+    barge_in = config.ENABLE_BARGE_IN
+    yield
+    for lang, entry in voices.items():
+        config.LANGUAGE_MAP[lang].update(entry)
+    config.ENABLE_BARGE_IN = barge_in
+
+
+def test_config_get_gives_the_dialog_everything_it_needs(conn):
+    status, payload = get(conn, "/api/config")
+    assert status == 200
+    assert payload["duplex"] in ("half", "full")
+    assert {lang["code"] for lang in payload["languages"]} == set(config.LANGUAGE_MAP)
+    for lang in payload["languages"]:
+        assert lang["label"]
+        assert lang["voice"] in lang["voices"]
+
+
+def test_config_post_sets_a_voice_and_echoes_the_new_state(conn, restore_settings):
+    status, payload = post(conn, "/api/config", {"voices": {"en": "am_adam"}})
+    assert status == 200
+    assert config.voice_for("en") == "am_adam"
+    english = next(l for l in payload["languages"] if l["code"] == "en")
+    assert english["voice"] == "am_adam"
+
+
+def test_config_post_switches_duplex_mode(conn, restore_settings):
+    assert post(conn, "/api/config", {"duplex": "full"})[1]["duplex"] == "full"
+    assert config.ENABLE_BARGE_IN is True
+    assert post(conn, "/api/config", {"duplex": "half"})[1]["duplex"] == "half"
+    assert config.ENABLE_BARGE_IN is False
+
+
+def test_config_post_accepts_both_settings_at_once(conn, restore_settings):
+    status, payload = post(conn, "/api/config", {
+        "voices": {"es": "em_alex", "zh": "zm_yunxi"},
+        "duplex": "full",
+    })
+    assert status == 200
+    assert payload["duplex"] == "full"
+    assert config.voice_for("es") == "em_alex"
+    assert config.voice_for("zh") == "zm_yunxi"
+
+
+def test_config_post_reports_the_old_voice_when_the_new_one_is_rejected(
+        conn, restore_settings):
+    """The dialog must show what took effect, not what it asked for."""
+    before = config.voice_for("en")
+    status, payload = post(conn, "/api/config", {"voices": {"en": "zf_xiaoxiao"}})
+    assert status == 200
+    english = next(l for l in payload["languages"] if l["code"] == "en")
+    assert english["voice"] == before
+
+
+def test_config_post_ignores_junk_without_breaking_the_connection(conn):
+    assert post(conn, "/api/config", {"voices": "not-a-dict", "duplex": 7})[0] == 200
+    assert post(conn, "/api/stop")[0] == 200
+
+
+def test_config_post_with_an_empty_body_is_a_read(conn):
+    assert post(conn, "/api/config")[1]["duplex"] == config.duplex_mode()

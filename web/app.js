@@ -13,6 +13,12 @@ const el = {
   statusDot: document.getElementById("status-dot"),
   persona: document.getElementById("persona"),
   error: document.getElementById("error"),
+  configOpen: document.getElementById("config-open"),
+  configClose: document.getElementById("config-close"),
+  configDialog: document.getElementById("config-dialog"),
+  configError: document.getElementById("config-error"),
+  voiceFields: document.getElementById("voice-fields"),
+  duplex: document.getElementById("duplex"),
 };
 
 const STATUS_TEXT = {
@@ -114,6 +120,114 @@ el.persona.addEventListener("change", async () => {
   }
 });
 
+/* --- configuration dialog -----------------------------------------------
+   Voice per language and half/full duplex. Both are read by the pipeline as it
+   runs -- the voice per synthesized sentence, the duplex mode per mic frame --
+   so every change applies at once and there is nothing to save.
+------------------------------------------------------------------------- */
+const config = (() => {
+  const selects = new Map();   // language code -> <select>
+
+  function showConfigError(message) {
+    el.configError.textContent = message;
+    el.configError.hidden = false;
+  }
+
+  function clearConfigError() {
+    el.configError.hidden = true;
+  }
+
+  /** Build one labelled select per language served by /api/config. */
+  function renderVoices(languages) {
+    el.voiceFields.textContent = "";
+    selects.clear();
+    for (const lang of languages) {
+      const row = document.createElement("label");
+      row.className = "field";
+
+      const name = document.createElement("span");
+      name.textContent = lang.label;
+      row.appendChild(name);
+
+      const select = document.createElement("select");
+      for (const voice of lang.voices) {
+        const opt = document.createElement("option");
+        opt.value = voice;
+        opt.textContent = voice;
+        select.appendChild(opt);
+      }
+      select.value = lang.voice;
+      select.addEventListener("change", () => apply({ voices: { [lang.code]: select.value } }));
+      row.appendChild(select);
+
+      selects.set(lang.code, select);
+      el.voiceFields.appendChild(row);
+    }
+  }
+
+  /** Reflect server state in the controls, so it is never merely optimistic. */
+  function render(state) {
+    if (state.languages) {
+      if (selects.size === state.languages.length) {
+        // Same set of languages: only update values, so an open dropdown and
+        // keyboard focus survive a change made in another tab.
+        for (const lang of state.languages) {
+          const select = selects.get(lang.code);
+          if (select) select.value = lang.voice;
+        }
+      } else {
+        renderVoices(state.languages);
+      }
+    }
+    if (state.duplex) el.duplex.checked = state.duplex === "full";
+  }
+
+  async function apply(patch) {
+    clearConfigError();
+    try {
+      render(await post("/api/config", patch));
+    } catch (err) {
+      showConfigError(err.message);
+      // Put the controls back to what the server actually has.
+      load().catch(() => {});
+    }
+  }
+
+  async function load() {
+    render(await (await fetch("/api/config")).json());
+  }
+
+  el.duplex.addEventListener("change", () =>
+    apply({ duplex: el.duplex.checked ? "full" : "half" }));
+
+  el.configOpen.addEventListener("click", () => {
+    clearConfigError();
+    // Re-read on open: the CLI or another tab may have changed something.
+    load().catch(() => showConfigError("Cannot reach the VirtualTutor server."));
+    if (typeof el.configDialog.showModal === "function") el.configDialog.showModal();
+    else el.configDialog.setAttribute("open", "");   // very old Safari
+  });
+
+  el.configClose.addEventListener("click", () => el.configDialog.close());
+
+  // Click outside the card closes it, matching the Esc key <dialog> gives us.
+  el.configDialog.addEventListener("click", (e) => {
+    if (e.target === el.configDialog) el.configDialog.close();
+  });
+
+  return {
+    load,
+    /** Apply a change that came from the server (another tab, or the CLI). */
+    setVoice(lang, voice) {
+      const select = selects.get(lang);
+      if (select && voice) select.value = voice;
+    },
+    setDuplex(mode) {
+      el.duplex.checked = mode === "full";
+    },
+  };
+})();
+
 el.toggle.addEventListener("click", async () => {
   if (busy) return;
   busy = true;
@@ -179,6 +293,14 @@ function connectEvents() {
         break;
       case "level":
         waves.setLevel(event.value);
+        break;
+      // Config changes are broadcast, so a second tab does not show stale
+      // settings after one of them changes a voice or the duplex mode.
+      case "voice":
+        config.setVoice(event.lang, event.voice);
+        break;
+      case "duplex":
+        config.setDuplex(event.mode);
         break;
       case "error":
         showError(event.text);
@@ -658,6 +780,7 @@ async function init() {
     el.persona.value = persona || fallback;
     setRunning(live);
     setStatus(live ? "listening" : "idle");
+    await config.load();
   } catch {
     showError("Cannot reach the VirtualTutor server.");
   }

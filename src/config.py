@@ -159,14 +159,91 @@ TTS_LANG_CODE = os.environ.get("VT_TTS_LANG", "a")
 # ---------------------------------------------------------------------------
 # Multilingual support
 # ---------------------------------------------------------------------------
-# Mapping from Whisper's detected language code to Kokoro pipeline code and
-# a default voice for that language.  The first entry is the fallback.
-LANGUAGE_MAP = {
-    "en": {"kokoro_lang": "a", "voice": os.environ.get("VT_TTS_VOICE", "af_heart")},
-    "es": {"kokoro_lang": "e", "voice": os.environ.get("VT_TTS_VOICE_ES", "ef_dora")},
-    "zh": {"kokoro_lang": "z", "voice": os.environ.get("VT_TTS_VOICE_ZH", "zf_xiaoxiao")},
-}
 DEFAULT_LANGUAGE = "en"  # fallback when detection is uncertain
+LANGUAGE_LABELS = {"en": "English", "es": "Spanish", "zh": "Chinese"}
+
+# Kokoro encodes the language in the voice name: the first letter is the G2P
+# pipeline ('a' US English, 'b' UK English, 'e' Spanish, 'z' Chinese) and the
+# second the speaker's gender. Voices offered per spoken language, so the UI can
+# change voice -- and, for English, US vs UK -- without restarting.
+AVAILABLE_VOICES = {
+    "en": [
+        "af_heart", "af_bella", "af_nicole", "af_aoede", "af_kore", "af_sarah",
+        "af_nova", "af_sky", "af_alloy", "af_jessica", "af_river",
+        "am_adam", "am_michael", "am_echo", "am_eric", "am_fenrir",
+        "am_liam", "am_onyx", "am_puck", "am_santa",
+        "bf_emma", "bf_alice", "bf_isabella", "bf_lily",
+        "bm_george", "bm_daniel", "bm_fable", "bm_lewis",
+    ],
+    "es": ["ef_dora", "em_alex", "em_santa"],
+    "zh": [
+        "zf_xiaoxiao", "zf_xiaobei", "zf_xiaoni", "zf_xiaoyi",
+        "zm_yunxi", "zm_yunjian", "zm_yunxia", "zm_yunyang",
+    ],
+}
+
+# Pipelines whose G2P this project has been verified against (viseme mapping
+# included). A voice whose prefix is not here falls back to TTS_LANG_CODE.
+VOICE_PIPELINES = {"a", "b", "e", "z"}
+
+# Pipeline used when a language's voice has an unrecognised prefix.
+_FALLBACK_PIPELINE = {"en": TTS_LANG_CODE, "es": "e", "zh": "z"}
+
+
+def kokoro_lang_for_voice(voice: str, fallback: str = TTS_LANG_CODE) -> str:
+    """Kokoro pipeline code implied by a voice name (its first letter)."""
+    code = (voice or "")[:1]
+    return code if code in VOICE_PIPELINES else fallback
+
+
+def _initial_voice(lang: str, env_var: str, default: str) -> str:
+    """Startup voice for `lang`, from `env_var` or `default`.
+
+    An explicit env-var voice outside the curated list is honored and added to
+    it, so the UI offers it rather than silently ignoring the user's choice.
+    """
+    voice = os.environ.get(env_var, "").strip() or default
+    if voice not in AVAILABLE_VOICES[lang]:
+        AVAILABLE_VOICES[lang].insert(0, voice)
+    return voice
+
+
+# Maps Whisper's detected language code to the Kokoro pipeline and voice used
+# to speak it. Mutated at runtime by set_voice(); tts.py reads it per sentence,
+# so a change needs no model reload.
+LANGUAGE_MAP = {
+    lang: {"kokoro_lang": kokoro_lang_for_voice(voice, _FALLBACK_PIPELINE[lang]),
+           "voice": voice}
+    for lang, voice in (
+        ("en", _initial_voice("en", "VT_TTS_VOICE", "af_heart")),
+        ("es", _initial_voice("es", "VT_TTS_VOICE_ES", "ef_dora")),
+        ("zh", _initial_voice("zh", "VT_TTS_VOICE_ZH", "zf_xiaoxiao")),
+    )
+}
+
+
+def set_voice(lang: str, voice: str) -> str:
+    """Point `lang` at `voice`, deriving its Kokoro pipeline from the prefix.
+
+    Returns the voice actually in force, which is the unchanged one if `lang`
+    or `voice` is not offered. Deriving the pipeline matters because a British
+    voice with the American G2P mispronounces words: picking `bf_emma` has to
+    switch the pipeline to 'b' as well.
+    """
+    entry = LANGUAGE_MAP.get(lang)
+    if entry is None:
+        return ""
+    if voice not in AVAILABLE_VOICES.get(lang, ()):
+        return entry["voice"]
+    entry["voice"] = voice
+    entry["kokoro_lang"] = kokoro_lang_for_voice(voice, _FALLBACK_PIPELINE[lang])
+    return voice
+
+
+def voice_for(lang: str) -> str:
+    """Voice currently used for a language ('' if the language is unknown)."""
+    entry = LANGUAGE_MAP.get(lang)
+    return entry["voice"] if entry else ""
 
 # ---------------------------------------------------------------------------
 # Behaviour
@@ -179,3 +256,35 @@ DEFAULT_LANGUAGE = "en"  # fallback when detection is uncertain
 # when using headphones.
 ENABLE_BARGE_IN = os.environ.get("VT_BARGE_IN", "0") == "1"
 BARGE_IN_MIN_RMS = 0.02      # frame must be this loud (louder than echo) to count
+# Speech needed to confirm an interruption, as evidence rather than as an
+# unbroken run: BARGE_IN_DECAY is how much of it a non-speech frame gives back.
+# Requiring consecutive frames instead never fired at all on short interjections
+# ("Stop.", "Wait!"), because speech dips below the threshold between words.
+BARGE_IN_SPEECH_DURATION = 0.25
+BARGE_IN_DECAY = 0.5
+# Audio kept before an interruption is confirmed, so the words that triggered it
+# start the new utterance instead of being discarded. Longer than the pre-roll
+# used for normal speech onset, since confirming takes up to ~0.85 s.
+BARGE_IN_PREROLL_DURATION = 1.2
+
+# Duplex mode is just a friendlier name for the same switch: "full" duplex
+# listens while speaking (barge-in on), "half" does not.
+HALF_DUPLEX, FULL_DUPLEX = "half", "full"
+
+
+def duplex_mode() -> str:
+    """Current duplex mode: 'full' if barge-in is enabled, else 'half'."""
+    return FULL_DUPLEX if ENABLE_BARGE_IN else HALF_DUPLEX
+
+
+def set_duplex_mode(mode: str) -> str:
+    """Switch duplex mode. Returns the mode in force.
+
+    Read live by the VAD worker on every frame, so this takes effect at once,
+    mid-session included. An unrecognised mode leaves things unchanged.
+    """
+    global ENABLE_BARGE_IN
+    if mode not in (HALF_DUPLEX, FULL_DUPLEX):
+        return duplex_mode()
+    ENABLE_BARGE_IN = mode == FULL_DUPLEX
+    return duplex_mode()
