@@ -2,13 +2,29 @@
 
 ## Project
 
-**VirtualTutor** — a continuous, real-time voice conversation tutor that runs
-fully on-device on Apple Silicon.
+**VirtualTutor** — a continuous, real-time voice conversation tutor for language
+learning, culture and travel, that runs fully on-device on Apple Silicon.
 
 ## One-line description
 
-Speak to it, it thinks, and it talks back — a low-latency, offline voice tutor
-built entirely from local models in unified memory.
+Speak to it, it thinks, and it talks back — a low-latency, offline tutor for
+languages, cultures and travel, built entirely from local models in unified
+memory.
+
+## Subjects
+
+The tutor teaches three connected things, and the shared system prompt keeps
+every persona inside them:
+
+- **Language** — useful words and phrases, pronunciation described in spoken
+  syllables (never phonetic symbols, which TTS cannot say), grammar in plain terms.
+- **Culture** — customs, etiquette, food, festivals and everyday life where the
+  language is spoken, treated as living and regional rather than as stereotypes.
+- **Travel** — planning a trip, getting around, ordering a meal, asking for
+  directions, being a considerate guest.
+
+Off-topic questions get a brief, helpful answer and an offer to return to one of
+the three.
 
 ## Problem statement
 
@@ -26,8 +42,9 @@ memory for responsive, natural back-and-forth conversation.
 
 ## Target audience
 
-- **Learners** who want a patient, always-available conversational tutor for
-  explaining concepts out loud.
+- **Learners** who want a patient, always-available conversational partner for
+  practising a language out loud and asking about the culture and travel that go
+  with it.
 - **Privacy-conscious users** who want their voice and conversations to stay on
   their own machine.
 - **Developers & researchers** exploring fully local, real-time voice agent
@@ -44,6 +61,9 @@ memory for responsive, natural back-and-forth conversation.
   the words you interrupted with, instead of stopping the tutor and then having
   nothing to answer.
 - **Clean transcription** — no hallucinated filler phrases reaching the LLM.
+- **Every reply is spoken in full, and only what is speakable** — no sentence cut
+  short by the TTS phoneme limit, no reasoning block or markdown character read
+  aloud, in any of the three languages.
 - **Settings you can change while talking** — the voice for each language applies
   from the tutor's next sentence and the duplex mode from the next mic frame, with
   no restart and no lost conversation.
@@ -51,7 +71,8 @@ memory for responsive, natural back-and-forth conversation.
   being spoken, accurate to the millisecond, with no additional model, and
   moving smoothly rather than snapping between shapes.
 - **A personality you can change** — personas are part of the tutor's identity,
-  selectable at startup and switchable mid-conversation.
+  selectable at startup and switchable mid-conversation, and a personality never
+  changes which subjects are taught.
 - **Multilingual without configuration** — speak English, Spanish or Chinese and
   the tutor detects the language, replies in it, and speaks it back with the
   correct voice and lip-sync.
@@ -72,7 +93,9 @@ memory for responsive, natural back-and-forth conversation.
 - **Robustness over cleverness** — defensive layers (energy gates, confidence
   thresholds, phrase blocklists, echo flushing) keep the experience stable.
 - **Conversational, spoken-first output** — short, plain-language replies suited
-  to text-to-speech, never markdown or code blocks.
+  to text-to-speech, never markdown or code blocks. The prompt asks for this, and
+  the pipeline enforces it: a prompt is guidance, so anything unsayable that the
+  model still produces is stripped or chunked before it reaches the speaker.
 - **Configurable, not hardcoded** — every model and behavior knob is overridable
   via environment variables, and the settings worth changing mid-conversation are
   read where they are used rather than captured at startup, so a dialog can change

@@ -10,6 +10,8 @@ normal forward pass, so the timeline is free: we read the pipeline's
 """
 from typing import List, Optional, Tuple
 
+import re
+
 import numpy as np
 
 import config
@@ -17,6 +19,67 @@ import visemes
 
 # (viseme, start_seconds, end_seconds)
 Timeline = List[Tuple[str, float, float]]
+
+# Where a too-long piece of text may be broken, best boundary first: a clause end
+# reads better than a comma, and a comma better than a bare word break. Both
+# ASCII and CJK/full-width punctuation, since Chinese replies contain neither
+# spaces nor ASCII terminators.
+_CHUNK_BOUNDARIES = (
+    re.compile(r"[.!?\u3002\uff01\uff1f\u2026]+[\s\"')\]\u201d\u2019\u300d\u300f\uff09]*"),
+    re.compile(r"[,;:\uff0c\u3001\uff1b\uff1a]+[\s\u201d\u2019\u300d\u300f\uff09]*"),
+    re.compile(r"\s+"),
+)
+
+
+# Markdown decoration that Kokoro pronounces instead of ignoring: misaki
+# phonemizes "*" as the word "asterisk", so an emphasised *boss* is spoken as
+# "asterisk boss asterisk" (verified against the pipeline's own phoneme output).
+# The system prompt tells the LLM to avoid these; stripping them here is what
+# guarantees they are never heard.
+_UNSPEAKABLE = re.compile(r"[*_`#]+|~~")
+
+
+def speakable(text: str) -> str:
+    """Drop markdown characters that TTS would read out as words."""
+    return re.sub(r"[ \t]{2,}", " ", _UNSPEAKABLE.sub("", text)).strip()
+
+
+def max_chunk_chars(lang_code: str) -> int:
+    """Character budget for one Kokoro forward pass in `lang_code`."""
+    return config.TTS_MAX_CHUNK_CHARS.get(lang_code,
+                                          config.TTS_MAX_CHUNK_CHARS_DEFAULT)
+
+
+def chunk_text(text: str, lang_code: str) -> List[str]:
+    """Split `text` into pieces short enough for Kokoro to speak in full.
+
+    Kokoro accepts at most `config.TTS_MAX_PHONEMES` phonemes per forward pass
+    and mlx-audio truncates anything longer, which cuts the audio off mid-word.
+    Its own chunker only splits on ASCII `.!?` at 400 characters, so a Chinese
+    reply -- ~4 phonemes per character, and terminated by U+3002 rather than a
+    period -- overshoots and loses its tail. Splitting here instead keeps whole
+    clauses together and never hands the pipeline more than it can say.
+    """
+    limit = max_chunk_chars(lang_code)
+    rest = text.strip()
+    chunks: List[str] = []
+    while len(rest) > limit:
+        window = rest[:limit]
+        cut = 0
+        for pattern in _CHUNK_BOUNDARIES:
+            ends = [m.end() for m in pattern.finditer(window)]
+            if ends:
+                cut = ends[-1]
+                break
+        if cut == 0:
+            cut = limit  # no boundary at all: an unbroken run of characters
+        piece = rest[:cut].strip()
+        if piece:
+            chunks.append(piece)
+        rest = rest[cut:].lstrip()
+    if rest:
+        chunks.append(rest)
+    return chunks
 
 
 class KokoroTTS:
@@ -83,7 +146,7 @@ class KokoroTTS:
         alongside the audio -- all from the one forward pass that generate()
         would have made anyway.
         """
-        text = text.strip()
+        text = speakable(text)
         if not text:
             return np.zeros(0, dtype=np.float32), []
 
@@ -97,22 +160,22 @@ class KokoroTTS:
         elapsed = 0.0  # seconds of audio emitted so far, to offset each chunk
 
         try:
-            results = pipeline(text, voice=voice, speed=self.speed)
-            for result in results:
-                if result.audio is None:
-                    continue
-                chunk = np.asarray(result.audio, dtype=np.float32).reshape(-1)
-                if chunk.size == 0:
-                    continue
-                chunks.append(chunk)
-                if result.pred_dur is not None:
-                    timeline.extend(
-                        visemes.build_timeline(
-                            result.phonemes, [int(d) for d in result.pred_dur],
-                            vocab, offset_s=elapsed,
+            for segment in chunk_text(text, kokoro_lang):
+                for result in pipeline(segment, voice=voice, speed=self.speed):
+                    if result.audio is None:
+                        continue
+                    chunk = np.asarray(result.audio, dtype=np.float32).reshape(-1)
+                    if chunk.size == 0:
+                        continue
+                    chunks.append(chunk)
+                    if result.pred_dur is not None:
+                        timeline.extend(
+                            visemes.build_timeline(
+                                result.phonemes, [int(d) for d in result.pred_dur],
+                                vocab, offset_s=elapsed,
+                            )
                         )
-                    )
-                elapsed += chunk.size / self.sample_rate
+                    elapsed += chunk.size / self.sample_rate
         except Exception as e:
             # Never let lip-sync break speech: fall back to plain synthesis.
             print(f"[TTS] viseme path failed ({e}); falling back to plain synthesis")

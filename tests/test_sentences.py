@@ -80,3 +80,41 @@ def test_nothing_is_lost_or_duplicated():
 def test_blank_input_never_yields_a_sentence_to_speak(blank):
     sentence, _ = va.next_sentence(blank)
     assert not sentence
+
+
+# --- CJK punctuation --------------------------------------------------------
+# Chinese has no spaces and does not use ASCII terminators, so requiring
+# "punctuation + whitespace" never fired: a whole reply reached TTS as one chunk
+# and Kokoro truncated its tail ("Truncating len(ps) == 657 > 510").
+
+ZH_FIRST = "\u5149\u5408\u4f5c\u7528\u662f\u690d\u7269\u5236\u9020\u98df\u7269\u7684\u65b9\u5f0f\u3002"
+ZH_SECOND = "\u5b83\u9700\u8981\u9633\u5149\u3001\u6c34\u548c\u4e8c\u6c27\u5316\u78b3\u3002"
+
+
+def test_chinese_full_stop_ends_a_sentence_without_whitespace():
+    sentence, rest = va.next_sentence(ZH_FIRST + ZH_SECOND)
+    assert sentence == ZH_FIRST
+    assert rest == ZH_SECOND
+
+
+@pytest.mark.parametrize("terminator", ["\u3002", "\uff01", "\uff1f", "\uff1b", "\uff1a", "\u2026"])
+def test_every_cjk_terminator_splits(terminator):
+    sentence, rest = va.next_sentence("\u4f60\u597d" + terminator + "\u518d\u89c1")
+    assert sentence == "\u4f60\u597d" + terminator
+    assert rest == "\u518d\u89c1"
+
+
+def test_chinese_closing_quote_stays_with_the_sentence():
+    text = "\u4ed6\u8bf4\uff1a\u201c\u505c\u4e0b\u3002\u201d\u7136\u540e"
+    sentence, rest = va.next_sentence(text)
+    assert sentence.endswith("\u201d")
+    assert rest == "\u7136\u540e"
+
+
+def test_chinese_comma_does_not_split_early():
+    """A comma is a pause, not a sentence end -- TTS keeps the clause together."""
+    assert va.next_sentence("\u690d\u7269\u9700\u8981\u9633\u5149\uff0c\u4e5f\u9700\u8981\u6c34")[0] is None
+
+
+def test_streamed_chinese_produces_whole_sentences():
+    assert drain(ZH_FIRST + ZH_SECOND, chunk=2) == [ZH_FIRST, ZH_SECOND]

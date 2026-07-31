@@ -2,11 +2,13 @@
 
 A continuous, real-time **voice conversation** tutor that runs fully on-device on
 Apple Silicon. Speak to it, it thinks, and it talks back — and in full duplex you
-can cut it off mid-sentence. Supports **English**, **Spanish**, and **Chinese**
-with automatic language detection.
+can cut it off mid-sentence. It tutors **language learning, culture and travel**:
+useful phrases and how they are pronounced, how a custom actually works, and what
+to do once you are there. Supports **English**, **Spanish**, and **Chinese** with
+automatic language detection.
 
 ```
-Microphone ─PCM─▶ Silero VAD ─audio─▶ mlx-whisper ─text─▶ llama.cpp (Qwen2.5-7B)
+Microphone ─PCM─▶ Silero VAD ─audio─▶ mlx-whisper ─text─▶ llama.cpp (Qwen3-8B)
                   (speech end)         (STT)                    │ token stream
                                         │ lang detect           ▼
 Speakers ◀─PCM─ Kokoro TTS ◀─sentences─ sentence-split buffer ◀─┘
@@ -17,13 +19,34 @@ Speakers ◀─PCM─ Kokoro TTS ◀─sentences─ sentence-split buffer ◀─
 All four models sit in unified memory at once, giving low-latency responses.
 Tested on **Apple M3 Pro / 36 GB / macOS**.
 
+## What it teaches
+
+The shared system prompt in `src/config.py` scopes the tutor to three connected
+subjects, and every persona inherits them:
+
+- **Language** — useful words and phrases, grammar in plain terms, and
+  pronunciation given as spoken syllables. Phonetic symbols are pointless here:
+  the tutor's words go through TTS, so `/ˈkwen.ta/` would be read out as symbols.
+- **Culture** — customs, etiquette, food, festivals and everyday life where the
+  language is spoken, as something regional and changing rather than a list of
+  national traits.
+- **Travel** — planning a trip, getting around, ordering a meal, asking for
+  directions, being a considerate guest.
+
+Ask it something else and it answers in a sentence, then offers a way back. It
+will not write code or markdown even when asked directly, because everything it
+says is spoken: a fenced code block reaches the speaker as "backtick backtick
+backtick". For the same reason `src/tts.py` strips markdown decoration before
+synthesis — misaki phonemizes `*` as the word "asterisk", so an emphasised
+`*boss*` would otherwise be spoken as "asterisk boss asterisk".
+
 ## Components
 
 | Stage | Tech | Notes |
 |-------|------|-------|
 | VAD   | Silero VAD v5 (`silero-vad`) | detects end of speech and barge-in, offline |
 | STT   | `mlx-whisper` (`whisper-small`, multilingual) | Metal-accelerated transcription, auto-detects language |
-| LLM   | `llama.cpp` server + Qwen2.5-7B-Instruct Q4_K_M | OpenAI-compatible, streaming |
+| LLM   | `llama.cpp` server + Qwen3-8B Q5_K_M | OpenAI-compatible, streaming, thinking disabled |
 | TTS   | Kokoro-82M via `mlx-audio` | 24 kHz, multilingual (EN/ES/ZH), voice switchable live |
 | Lip-sync | Kokoro's own phoneme durations | no second model, frame-accurate |
 | UI    | stdlib HTTP + SSE, static HTML/CSS/JS | optional; CLI works alone |
@@ -45,7 +68,7 @@ brew install portaudio ffmpeg espeak-ng llama.cpp
 /opt/homebrew/bin/python3.11 -m venv .venv
 ./.venv/bin/pip install -r requirements.txt
 
-# 3. Download the LLM (~4.7 GB)
+# 3. Download the LLM (~5.9 GB)
 ./scripts/download_model.sh
 ```
 
@@ -90,6 +113,7 @@ by number, or press Enter for the default. You can skip the menu by presetting
 | `jester` | The Witty Jester | Clever puns, gentle teasing, fast-paced humor |
 | `cheerleader` | The Enthusiastic Cheerleader | High energy, hyper-positive encouragement |
 | `explorer` | The Curious Explorer | Treats every question like a fun mystery |
+| `secretary` | The Sassy Secretary | Deadpan office wit, runs the session like your diary |
 
 The persona is part of the tutor's identity, not just its tone: ask "who are
 you?" and it answers in character ("I am VirtualTutor speaking as The Witty
@@ -121,6 +145,18 @@ How it works:
 
 Language switching is seamless: speak Spanish mid-conversation and the tutor
 switches to Spanish on its next reply.
+
+Two things had to be language-aware for a reply to be spoken *in full*. The
+sentence splitter now recognises CJK terminators (`。！？；：…`), which have no
+trailing space and are what Chinese actually ends a sentence with — without them
+a whole Chinese reply reached TTS as one block. And Kokoro synthesizes at most
+510 phonemes per forward pass, silently truncating the rest
+(`WARNING:root:Truncating len(ps) == 657 > 510`), so `src/tts.py` splits text on
+clause boundaries first, with a per-pipeline character budget: Chinese runs
+~4.1 phonemes per character against Spanish's ~1.1, so the same 400-character
+block mlx-audio uses for both overshoots badly in Chinese. Measured on one long
+Chinese reply, the unchunked path spoke 20.45 s and dropped the remaining 9.10 s;
+chunked, it speaks all 29.55 s.
 
 ## Web UI
 
@@ -318,12 +354,14 @@ reachability.
 ## Tests
 
 Unit tests cover the pure logic that is easy to break and hard to notice: the
-viseme timeline, the sentence splitter feeding TTS, the Whisper
+viseme timeline, the sentence splitter feeding TTS, the chunking that keeps
+Kokoro from truncating a long reply, the markdown stripped before speech, the
+`<think>` filter, the Whisper
 anti-hallucination guards, history trimming, persona prompts and switching, the
 runtime settings behind the Configuration dialog (voice per language, the
 pipeline each voice implies, duplex mode), the barge-in decision and the photo
 avatar's asset contract. They load no models and open no audio devices, so the
-suite (171 tests) runs in
+suite (231 tests) runs in
 about two seconds.
 
 ```bash
@@ -346,12 +384,30 @@ Everything is in `src/config.py` and can be overridden with env vars:
 | `VT_TTS_VOICE_ES` | `ef_dora` | Kokoro voice for Spanish |
 | `VT_TTS_VOICE_ZH` | `zf_xiaoxiao` | Kokoro voice for Chinese |
 | `VT_LLAMA_URL` | `http://localhost:8080/v1/chat/completions` | LLM endpoint |
-| `VT_MODEL_FILE` | `Qwen2.5-7B-Instruct-Q4_K_M.gguf` | GGUF filename |
-| `VT_PERSONA` | `tutor` | tutor personality: `tutor`, `jester`, `cheerleader`, `explorer` |
+| `VT_MODEL_FILE` | `Qwen_Qwen3-8B-Q5_K_M.gguf` | GGUF filename |
+| `VT_MODEL_REPO` | `bartowski/Qwen_Qwen3-8B-GGUF` | Hugging Face repo the GGUF is downloaded from |
+| `VT_PERSONA` | `tutor` | tutor personality: `tutor`, `jester`, `cheerleader`, `explorer`, `secretary` |
 | `VT_BARGE_IN` | `0` | set `1` to allow interrupting the tutor (headphones only) |
 
 With 36 GB you can step up quality: set `VT_WHISPER_MODEL=mlx-community/whisper-medium-mlx`
 and use a 14B `Q5_K_M` GGUF for the LLM.
+
+### Thinking mode
+
+Qwen3 is a hybrid reasoning model: asked a question it works the answer out
+inside `<think> ... </think>` before replying. For a voice tutor that is dead air
+of several seconds, so `start_server.sh` passes `--reasoning-budget 0`, which
+tells the chat template to close thinking immediately. Measured on this machine,
+the first *spoken* sentence leaves the LLM 1.1–1.9 s after the prompt.
+
+The agent also strips `<think>` blocks out of the token stream
+(`ThinkFilter` in `src/voice_agent.py`), matching tags that arrive split across
+tokens. That guard matters because whether the tags reach the client depends on
+llama.cpp's `--reasoning-format`: with the default they are parsed out into
+`reasoning_content`, but with `--reasoning-format none` an empty
+`<think></think>` pair lands in the reply text — and TTS would try to pronounce
+it. Filtering also keeps the tags out of the transcript and out of the history
+that gets re-prefilled every turn.
 
 ## Notes & limits
 
@@ -366,6 +422,12 @@ and use a 14B `Q5_K_M` GGUF for the LLM.
   leading up to a barge-in is kept so the interrupting words are transcribed.
 - First run downloads model weights (Kokoro, Whisper, spaCy `en_core_web_sm`,
   and the GGUF); subsequent runs are offline except the local HTTP call.
+- The prompt asks for 1–3 sentences and mostly gets them in English; Chinese
+  replies often run longer. They are spoken in full either way, since text is
+  chunked under Kokoro's phoneme limit, but expect a paragraph rather than a line.
+- Cultural and travel claims are the LLM's, and an 8B model states wrong ones
+  confidently — in testing it told me not to use the left hand in Spain, which is
+  not a Spanish custom. Treat it as conversation practice, not a guidebook.
 
 ## Layout
 
@@ -395,9 +457,9 @@ virtualtutor/
 │   └── avatar/             # photo sprites (committed, ~200 KB)
 └── src/
     ├── config.py
-    ├── tts.py
+    ├── tts.py              # Kokoro synthesis, chunked under the phoneme limit
     ├── visemes.py          # IPA -> mouth shape timeline for lip-sync
-    ├── voice_agent.py
+    ├── voice_agent.py      # pipeline threads, sentence split, <think> filter
     ├── server.py           # local web server (stdlib only)
     └── verify.py
 ```

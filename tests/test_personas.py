@@ -52,3 +52,41 @@ def test_base_rules_are_tts_safe():
     rules = config.BASE_SYSTEM_PROMPT.lower()
     for constraint in ("no markdown", "no lists", "no emojis"):
         assert constraint in rules
+
+
+def test_base_rules_name_the_three_subjects():
+    """The tutor teaches language, culture and travel -- not arbitrary homework."""
+    rules = config.BASE_SYSTEM_PROMPT.lower()
+    for topic in ("language", "culture", "travel"):
+        assert topic in rules
+
+
+def test_pronunciation_guidance_stays_speakable():
+    """Phonetic symbols or spelled-out letters are unusable through TTS."""
+    rules = config.BASE_SYSTEM_PROMPT.lower()
+    assert "spoken syllables" in rules
+    assert "never as phonetic symbols" in rules
+
+
+def test_language_mirroring_survives_the_topic_change():
+    rules = config.BASE_SYSTEM_PROMPT
+    assert "same language the student uses" in rules
+    for language in ("Spanish", "Chinese"):
+        assert language in rules
+
+
+@pytest.mark.parametrize("key", sorted(config.PERSONAS))
+def test_every_persona_inherits_the_subjects(key):
+    """A personality changes the delivery, never what is being taught."""
+    prompt = config.build_system_prompt(key).lower()
+    for topic in ("language", "culture", "travel"):
+        assert topic in prompt
+
+
+def test_secretary_persona_is_offered():
+    """The sassy secretary is a persona like any other: menu, API and prompt."""
+    assert "secretary" in config.PERSONAS
+    assert config.persona_name("secretary") == "The Sassy Secretary"
+    prompt = config.build_system_prompt("secretary")
+    assert config.BASE_SYSTEM_PROMPT in prompt      # still a tutor underneath
+    assert "sassy" in prompt.lower()

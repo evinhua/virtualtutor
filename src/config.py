@@ -49,18 +49,38 @@ LLAMA_SERVER_URL = os.environ.get("VT_LLAMA_URL", "http://localhost:8080/v1/chat
 LLM_TEMPERATURE = 0.7
 LLM_MAX_TOKENS = 300
 
-# Core tutoring rules shared by every persona. These keep replies short and
-# safe for text-to-speech; personas layer a personality on top of this base.
+# Core tutoring rules shared by every persona: the subjects the tutor teaches
+# (language, culture, travel) plus the constraints that keep replies short and
+# safe for text-to-speech. Personas layer a personality on top of this base.
 BASE_SYSTEM_PROMPT = (
-    "You are VirtualTutor, a tutor speaking out loud to a student. "
-    "Explain concepts clearly and simply, one idea at a time. "
+    "You are VirtualTutor, a language, culture and travel tutor speaking out loud "
+    "to a student. Your subjects are learning languages (useful words and phrases, "
+    "pronunciation, grammar explained in plain terms), the cultures where those "
+    "languages are spoken (customs, etiquette, food, festivals, everyday life), and "
+    "travelling in those places (planning a trip, getting around, ordering a meal, "
+    "asking for directions, being a considerate guest). "
+    "Teach through conversation: give one phrase or idea at a time, say what it "
+    "means, and invite the student to try it or to tell you about their own trip. "
+    "Correct mistakes gently by saying the natural version once, without lecturing. "
+    "Describe pronunciation as simple spoken syllables, never as phonetic symbols "
+    "or spelled-out letters, because your words are spoken aloud. "
+    "Treat cultures as living and varied rather than as stereotypes, and say when a "
+    "custom differs by region or generation. "
+    "If the student asks about something outside these subjects, give one short "
+    "spoken answer or say plainly that it is not what you are for, and use your "
+    "follow-up question to bring the conversation back to language, culture or "
+    "travel. Never write code, markdown or a code block, even when asked directly: "
+    "everything you say is read aloud, so brackets and backticks are unusable. "
     "Keep spoken answers short: 1-3 sentences, no markdown, no lists, no code blocks, "
-    "no emojis. Use plain conversational language suitable for text-to-speech. "
-    "If the student seems confused, offer a simpler explanation or an analogy. "
-    "Ask a brief follow-up question to check understanding when helpful. "
+    "no emojis. Use plain conversational language suitable for text-to-speech, with "
+    "no asterisks or underscores around words: they are read aloud as the word "
+    "\"asterisk\". "
+    "If the student seems confused, offer a simpler explanation or an example. "
+    "Ask a brief follow-up question to keep the conversation going when helpful. "
     "Always reply in the same language the student uses. If the student speaks "
     "Spanish, reply in Spanish. If they speak Chinese, reply in Chinese. "
-    "Match their language naturally without commenting on the switch."
+    "Match their language naturally without commenting on the switch. When you quote "
+    "a word or phrase from another language, keep it short so it stays clear aloud."
 )
 
 # ---------------------------------------------------------------------------
@@ -105,6 +125,19 @@ PERSONAS = {
             "Your personality is a curious explorer. Treat every question like a fun "
             "mystery or an exciting treasure hunt, expressing wonder and asking quirky, "
             "playful follow-up questions that invite the student to explore with you."
+        ),
+    },
+    "secretary": {
+        "name": "The Sassy Secretary",
+        "blurb": "Deadpan office wit who runs your study session like your diary.",
+        "style": (
+            "Your personality is a sassy, funny secretary who treats the student as the "
+            "boss whose day you cheerfully manage. Be quick and a little deadpan, tease "
+            "them lightly when they dodge the work or ask the same thing twice, and use "
+            "dry office humor: filing their doubts under 'later', penciling the hard part "
+            "in for right now, noting that the excuse has been received. Keep the sass "
+            "affectionate and professional rather than mean or flirtatious, and always "
+            "land the explanation before the punchline."
         ),
     },
 }
@@ -155,6 +188,23 @@ TTS_SAMPLE_RATE = 24000      # Kokoro outputs 24 kHz audio
 # Kokoro language pipeline: 'a' = American English, 'b' = British English.
 # Also selects which misaki G2P is used, which the viseme timeline depends on.
 TTS_LANG_CODE = os.environ.get("VT_TTS_LANG", "a")
+
+# Kokoro's acoustic model takes at most 510 phoneme tokens per forward pass.
+# mlx-audio's non-English path chunks text at 400 *characters* and then silently
+# truncates the phonemes ("WARNING:root:Truncating len(ps) == 657 > 510"), which
+# drops the tail of the sentence: the tutor stops speaking mid-reply. So we chunk
+# before handing text to the pipeline, with a per-pipeline character budget
+# derived from the measured phoneme density of each G2P (misaki zh: 4.13
+# phonemes/char, espeak es: 1.13, so the same character count is ~4x heavier in
+# Chinese). Budgets keep the worst case comfortably under 510.
+TTS_MAX_PHONEMES = 510
+TTS_MAX_CHUNK_CHARS = {
+    "a": 300,   # American English -- Kokoro chunks these itself; a cap is belt and braces
+    "b": 300,   # British English
+    "e": 350,   # Spanish
+    "z": 100,   # Chinese: ~4.1 phonemes per character
+}
+TTS_MAX_CHUNK_CHARS_DEFAULT = 200
 
 # ---------------------------------------------------------------------------
 # Multilingual support

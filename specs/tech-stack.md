@@ -20,8 +20,8 @@ fully local operation possible.
 |-------|-----------|-----------|
 | VAD (voice activity detection) | Silero VAD v5 (`silero-vad`, via `torch`) | Accurate, lightweight, fully offline end-of-speech detection at 16 kHz. The same per-frame probability also decides barge-in in full duplex. |
 | STT (speech-to-text) | `mlx-whisper` — `whisper-small` (multilingual) | Metal-accelerated Whisper on Apple Silicon; multilingual model auto-detects English, Spanish and Chinese. |
-| LLM | `llama.cpp` server + Qwen2.5-7B-Instruct Q4_K_M (GGUF) | OpenAI-compatible streaming endpoint, strong 7B instruct model that fits comfortably in memory at Q4_K_M. |
-| TTS (text-to-speech) | Kokoro-82M via `mlx-audio` (24 kHz, multilingual) | Small, natural-sounding, Metal-accelerated local TTS. Voices are listed per language in `config.AVAILABLE_VOICES` and selectable at runtime; the default is `af_heart` (EN), `ef_dora` (ES), `zf_xiaoxiao` (ZH). |
+| LLM | `llama.cpp` server + Qwen3-8B Q5_K_M (GGUF) | OpenAI-compatible streaming endpoint. Qwen3 is a hybrid reasoning model, so the server runs with `--reasoning-budget 0` and the agent strips `<think>` blocks from the stream: a spoken tutor cannot afford seconds of silent working-out. |
+| TTS (text-to-speech) | Kokoro-82M via `mlx-audio` (24 kHz, multilingual) | Small, natural-sounding, Metal-accelerated local TTS. Voices are listed per language in `config.AVAILABLE_VOICES` and selectable at runtime; the default is `af_heart` (EN), `ef_dora` (ES), `zf_xiaoxiao` (ZH). Text is chunked and stripped of markdown before synthesis — see *Nothing reaches the speaker unsayable* under Architecture. |
 | Lip-sync | Kokoro's own duration predictor (`src/visemes.py`) | The frame count per phoneme falls out of the normal forward pass, so a frame-accurate viseme timeline costs no extra inference and no audio analysis. |
 | Frontend | Python stdlib `ThreadingHTTPServer` + Server-Sent Events, static HTML/CSS/JS | A control surface and transcript view with zero added dependencies and no build step. Audio stays in Python, which preserves the half-duplex echo handling. |
 
@@ -79,7 +79,24 @@ fully local operation possible.
   from playback lets the next sentence be generated while the current one is
   still being spoken.
 - **Streaming end to end.** LLM tokens are split into sentences on the fly and
-  handed to TTS immediately, minimizing perceived latency.
+  handed to TTS immediately, minimizing perceived latency. The splitter is
+  language-aware: CJK terminators (`。！？；：…`) end a sentence on their own,
+  because Chinese has no trailing space and no ASCII punctuation, and without
+  them a whole Chinese reply reached TTS as a single block.
+- **Nothing reaches the speaker unsayable.** Two guards sit in front of Kokoro,
+  both of them because the failure is silent rather than an exception. Text is
+  chunked to a per-pipeline character budget (`config.TTS_MAX_CHUNK_CHARS`), since
+  mlx-audio truncates anything over 510 phonemes and simply drops the rest of the
+  sentence — Chinese runs ~4.1 phonemes per character against Spanish's ~1.1, so
+  one character budget cannot serve both. And markdown decoration is stripped
+  (`tts.speakable()`), because misaki phonemizes `*` as the word "asterisk": an
+  emphasised `*boss*` is otherwise spoken as "asterisk boss asterisk".
+- **Reasoning is off, and filtered anyway.** Qwen3 thinks before answering by
+  default, which is dead air in a voice loop. The server closes thinking
+  immediately (`--reasoning-budget 0`) and `ThinkFilter` strips `<think>` blocks
+  from the token stream, matching tags split across tokens — whether they reach
+  the client at all depends on llama.cpp's `--reasoning-format`, so the client
+  cannot assume they will not.
 - **Half-duplex by default.** The agent does not listen while speaking and
   flushes echo picked up during playback. Full duplex (barge-in) is opt-in and
   assumes headphones.
@@ -111,10 +128,13 @@ fully local operation possible.
 - **UI events are a bounded queue.** `emit()` publishes to a 512-slot queue and
   drops the oldest event if nothing is draining it, so a CLI session with no
   browser attached cannot grow without limit.
-- **Personas are prompt layers.** `config.build_system_prompt()` combines shared
-  tutoring rules with a personality and the persona's name (so "who are you?" is
-  answered in character); `set_persona()` rewrites the prompt in place, which
-  makes mid-session switching possible while keeping the conversation.
+- **Personas are prompt layers.** `config.build_system_prompt()` combines the
+  shared tutoring rules — the subjects (language, culture, travel) and the
+  spoken-output constraints — with a personality and the persona's name (so "who
+  are you?" is answered in character); `set_persona()` rewrites the prompt in
+  place, which makes mid-session switching possible while keeping the
+  conversation. Five personas ship: tutor, jester, cheerleader, explorer,
+  secretary.
 - **The HTTP server keeps connections alive,** so every POST handler must consume
   its request body even when it ignores it. An unread body is parsed as the next
   request line and answered with 501, which showed up as the first Start after a
@@ -122,11 +142,12 @@ fully local operation possible.
 
 ## Testing
 
-- **`pytest`** (`requirements-dev.txt`, pinned), 171 tests: the viseme timeline
-  (43), STT hallucination guards (26), persona prompts (20), the HTTP layer (17),
-  the runtime settings behind the Configuration dialog (16), sentence splitting
-  (13), the barge-in decision (11), persona switching and session lifecycle (10),
-  the avatar asset contract (9) and history trimming (6).
+- **`pytest`** (`requirements-dev.txt`, pinned), 231 tests: the viseme timeline
+  (43), persona prompts and subjects (33), STT hallucination guards (26),
+  sentence splitting including CJK (23), TTS chunking and markdown stripping (22),
+  the HTTP layer (17), the runtime settings behind the Configuration dialog (16),
+  the `<think>` filter (15), the barge-in decision (11), persona switching and
+  session lifecycle (10), the avatar asset contract (9) and history trimming (6).
 - **No models, no audio devices.** The suite runs in about two seconds. The HTTP
   tests drive the real handler over a socket on an ephemeral port, reusing one
   connection the way a browser does; avatar tests skip if `web/avatar/` has been
@@ -173,6 +194,11 @@ fully local operation possible.
 - Real-time performance and simultaneous model residency assume Apple Silicon
   with ~36 GB unified memory. Larger models (whisper-medium, 14B Q5_K_M LLM) are
   supported but trade memory for quality.
+- **Kokoro synthesizes at most 510 phonemes per forward pass** and mlx-audio
+  truncates the excess with only a log warning, so the audio ends mid-sentence
+  with nothing raised. Measured on one long Chinese reply: 20.45 s spoken, 9.10 s
+  dropped. Chunking before the pipeline is the only defence, and the budget has to
+  be per language because phoneme density differs by ~4x.
 - **Full duplex needs headphones, and no threshold can fix that.** Nothing at
   frame level distinguishes the user's voice from the tutor's own voice returning
   through a speaker at the same level. `BARGE_IN_MIN_RMS` is the only guard:

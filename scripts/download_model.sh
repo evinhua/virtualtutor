@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Download the LLM GGUF used by llama-server.
-# Default: Qwen2.5-7B-Instruct Q4_K_M (~4.7 GB) - great balance for voice on M3 Pro.
+# Default: Qwen3-8B Q5_K_M (~5.9 GB) - stronger than Qwen2.5-7B and still fast
+# enough for voice on an M3 Pro. Qwen3 is a hybrid reasoning model; thinking is
+# switched off at the server (see start_server.sh), which voice needs anyway.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-MODEL_REPO="${VT_MODEL_REPO:-bartowski/Qwen2.5-7B-Instruct-GGUF}"
-MODEL_FILE="${VT_MODEL_FILE:-Qwen2.5-7B-Instruct-Q4_K_M.gguf}"
+MODEL_REPO="${VT_MODEL_REPO:-bartowski/Qwen_Qwen3-8B-GGUF}"
+MODEL_FILE="${VT_MODEL_FILE:-Qwen_Qwen3-8B-Q5_K_M.gguf}"
 DEST="models/${MODEL_FILE}"
 
 if [[ -f "$DEST" ]]; then

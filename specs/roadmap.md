@@ -11,6 +11,11 @@ The current working pipeline.
 - End-of-speech detection with configurable silence duration and pre-roll so the
   first word is not clipped.
 - Streaming LLM replies split into sentences and spoken as they arrive.
+  *(The splitter recognises CJK terminators as well as ASCII ones, and text is
+  chunked to a per-language character budget before Kokoro, which otherwise
+  truncates anything past 510 phonemes and drops the rest of the reply. The LLM
+  is Qwen3-8B with thinking closed immediately, so a reply starts rather than
+  being reasoned about first.)*
 - Half-duplex playback with echo flushing; opt-in barge-in for headphones.
   *(Barge-in was reworked after it was reported as not interrupting at all: the
   gate required consecutive loud frames, which short interjections never produce,
@@ -34,10 +39,11 @@ Make the existing experience reliable and easy to adopt.
   unwind silently, and the web server explains a busy port rather than dumping a
   traceback. Logging levels are still open.)*
 - Automated tests for the STT hallucination filters and sentence-splitting.
-  *(Delivered: `tests/` runs 171 tests in about two seconds, without loading
-  models or opening audio devices — also covering the viseme timeline, history
-  trimming, persona switching, runtime settings, the barge-in decision, the HTTP
-  layer over a real socket, and the avatar asset contract.)*
+  *(Delivered: `tests/` runs 231 tests in about two seconds, without loading
+  models or opening audio devices — also covering the viseme timeline, TTS
+  chunking and markdown stripping, the `<think>` filter, history trimming,
+  persona switching, runtime settings, the barge-in decision, the HTTP layer over
+  a real socket, and the avatar asset contract.)*
 - A single launcher that starts the LLM server and agent together.
   *(Delivered: `scripts/start_all.sh`.)*
 - Device selection / listing for input and output audio devices.
@@ -51,9 +57,12 @@ Improve the tutoring experience itself.
 
 - Persistent conversation memory across sessions (save/restore history).
 - Configurable tutor personas / subjects via prompt presets.
-  *(Personas delivered: startup menu + `VT_PERSONA` env var — tutor, jester,
-  cheerleader, explorer. Switchable mid-session from the web UI, and the tutor
-  identifies itself by persona when asked.)*
+  *(Delivered: the shared prompt scopes the tutor to language learning, culture
+  and travel, and five personas layer personality on top of it — tutor, jester,
+  cheerleader, explorer, secretary — selectable from the startup menu or
+  `VT_PERSONA` and switchable mid-session from the web UI, with the tutor
+  identifying itself by persona when asked. Subjects are one prompt rather than
+  selectable presets; a per-subject picker is still open.)*
 - Smarter history management (token-aware trimming, summarization of old turns).
 - Interruption-aware context so barge-in edits the ongoing turn cleanly.
   *(Half delivered: the interrupting utterance is now captured in full instead of
@@ -77,9 +86,15 @@ Widen who and how VirtualTutor can serve.
   the student uses. All phonemes produced by the Spanish and Chinese G2P are
   already covered by the viseme map, so lip-sync works across all three
   languages. Per-language voices are overridable via `VT_TTS_VOICE_ES` and
-  `VT_TTS_VOICE_ZH`, or changed mid-session from the Configuration dialog.)*
+  `VT_TTS_VOICE_ZH`, or changed mid-session from the Configuration dialog. Two
+  language-aware fixes were needed for a reply to be spoken in full: CJK sentence
+  terminators, and chunking text per language before Kokoro's 510-phoneme
+  limit — a long Chinese reply lost 9.10 s of 29.55 s without them.)*
 - Selectable quality tiers (small/medium Whisper, 7B/14B LLM) with guidance on
   memory tradeoffs.
+  *(The default LLM moved from Qwen2.5-7B Q4_K_M to Qwen3-8B Q5_K_M, swappable via
+  `VT_MODEL_REPO` / `VT_MODEL_FILE`; named tiers with memory guidance are still
+  open.)*
 - Optional lightweight UI (transcript view, push-to-talk, voice/model pickers).
   *(Delivered: local web UI with start/stop, live transcript, mic level, a
   persona picker that works mid-session, and a lip-synced avatar — either a

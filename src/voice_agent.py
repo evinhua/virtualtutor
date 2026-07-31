@@ -72,7 +72,18 @@ _last_llm_lang = config.DEFAULT_LANGUAGE
 HISTORY_HIGH_WATER = 24  # messages after the system prompt before trimming
 HISTORY_LOW_WATER = 12   # messages kept after a trim
 
-SENTENCE_END = re.compile(r"[.!?;:]+[\s\"')\]]*\s|[\n]+")
+# ASCII terminators only count when followed by whitespace, so "3.14" and
+# mid-word colons do not split the stream early. CJK terminators are
+# unambiguous and Chinese text carries no spaces, so they split on their own
+# (together with any closing quote or bracket). Without them a whole Chinese
+# reply arrived as one chunk, which Kokoro then truncated mid-sentence.
+SENTENCE_END = re.compile(
+    r"[.!?;:]+[\s\"')\]]*\s"
+    r"|[\u3002\uff01\uff1f\uff1b\uff1a\u2026]+"
+    r"(?![\u201c\u2018\u300c\u300e\uff08])"          # not a colon introducing a quote
+    r"[\u201d\u2019\u300d\u300f\uff09]*"
+    r"|[\n]+"
+)
 
 # ---------------------------------------------------------------------------
 # Session generation
@@ -334,6 +345,70 @@ def is_hallucination(text: str) -> bool:
     return normalized in config.STT_HALLUCINATION_PHRASES
 
 
+class ThinkFilter:
+    """Strips reasoning blocks out of a streamed reply, token by token.
+
+    Qwen3 is a hybrid reasoning model: unless thinking is switched off it emits
+    `<think> ... </think>` before the answer. Spoken aloud that is a monologue of
+    working-out, and it would also be stored in the history and re-prefilled on
+    every turn. Thinking is disabled at the server (`--reasoning-budget 0`), so
+    this is the guard for the case where a model or server emits the tags anyway.
+
+    Tags are matched across token boundaries: a stream can deliver "<th", "ink>",
+    so any tail that could still become a tag is held back rather than spoken.
+    """
+
+    OPEN = "<think>"
+    CLOSE = "</think>"
+
+    def __init__(self):
+        self.buffer = ""
+        self.inside = False
+
+    @staticmethod
+    def _partial_tail(text: str, tag: str) -> int:
+        """Length of the longest suffix of `text` that is a prefix of `tag`."""
+        for k in range(min(len(tag) - 1, len(text)), 0, -1):
+            if text.endswith(tag[:k]):
+                return k
+        return 0
+
+    def feed(self, token: str) -> str:
+        """Add `token`; return the text that is safe to speak now."""
+        self.buffer += token
+        out = []
+        while True:
+            if self.inside:
+                end = self.buffer.find(self.CLOSE)
+                if end >= 0:
+                    self.buffer = self.buffer[end + len(self.CLOSE):]
+                    self.inside = False
+                    continue
+                keep = self._partial_tail(self.buffer, self.CLOSE)
+                self.buffer = self.buffer[len(self.buffer) - keep:] if keep else ""
+                break
+            start = self.buffer.find(self.OPEN)
+            if start >= 0:
+                out.append(self.buffer[:start])
+                self.buffer = self.buffer[start + len(self.OPEN):]
+                self.inside = True
+                continue
+            keep = self._partial_tail(self.buffer, self.OPEN)
+            split = len(self.buffer) - keep
+            out.append(self.buffer[:split])
+            self.buffer = self.buffer[split:]
+            break
+        return "".join(out)
+
+    def flush(self) -> str:
+        """End of stream: release a held-back tail that never became a tag."""
+        if self.inside:      # unterminated thinking: nothing in it was for speech
+            self.buffer = ""
+            return ""
+        tail, self.buffer = self.buffer, ""
+        return tail
+
+
 def next_sentence(buffer: str):
     """Split the first complete sentence off `buffer`.
 
@@ -435,6 +510,7 @@ def stream_llm(prompt: str, lang: str = config.DEFAULT_LANGUAGE):
     }
     sentence = ""
     full_reply = ""
+    think = ThinkFilter()
     print(f"[{config.persona_name(active_persona)}]: ", end="", flush=True)
     try:
         resp = requests.post(config.LLAMA_SERVER_URL, json=payload, stream=True, timeout=120)
@@ -464,6 +540,9 @@ def stream_llm(prompt: str, lang: str = config.DEFAULT_LANGUAGE):
         token = data["choices"][0]["delta"].get("content", "")
         if not token:
             continue
+        token = think.feed(token)
+        if not token:
+            continue
         print(token, end="", flush=True)
         emit("assistant_delta", text=token)
         sentence += token
@@ -471,6 +550,12 @@ def stream_llm(prompt: str, lang: str = config.DEFAULT_LANGUAGE):
         complete, sentence = next_sentence(sentence)
         if complete:
             yield complete
+    tail = think.flush()
+    if tail:
+        print(tail, end="", flush=True)
+        emit("assistant_delta", text=tail)
+        sentence += tail
+        full_reply += tail
     print()
     if sentence.strip() and not interrupt_event.is_set():
         yield sentence.strip()
