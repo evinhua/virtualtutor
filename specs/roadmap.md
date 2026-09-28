@@ -6,16 +6,19 @@ Priority order is top-down: each phase builds on the previous one.
 
 The current working pipeline.
 
-- Threaded pipeline: microphone → Silero VAD → mlx-whisper → llama.cpp →
-  sentence buffer → Kokoro TTS → speakers.
+- Threaded pipeline: microphone → Silero VAD → mlx-whisper → Ollama →
+  sentence buffer → mood → Kokoro TTS → speakers.
 - End-of-speech detection with configurable silence duration and pre-roll so the
   first word is not clipped.
 - Streaming LLM replies split into sentences and spoken as they arrive.
   *(The splitter recognises CJK terminators as well as ASCII ones, and text is
   chunked to a per-language character budget before Kokoro, which otherwise
   truncates anything past 510 phonemes and drops the rest of the reply. The LLM
-  is Qwen3-8B with thinking closed immediately, so a reply starts rather than
-  being reasoned about first.)*
+  is Qwen3.8-Uncensored in Ollama with thinking closed immediately, so a reply
+  starts rather than being reasoned about first.)*
+- Emotional delivery: each sentence gets a mood (a cue the model wrote, signals
+  in the text, or the persona's baseline) that sets rate, pitch, loudness, the
+  pauses around it and how wide the avatar articulates.
 - Half-duplex playback with echo flushing; opt-in barge-in for headphones.
   *(Barge-in was reworked after it was reported as not interrupting at all: the
   gate required consecutive loud frames, which short interjections never produce,
@@ -33,7 +36,7 @@ The current working pipeline.
 Make the existing experience reliable and easy to adopt.
 
 - Structured logging (levels, quiet/verbose modes) replacing ad-hoc prints.
-- Graceful startup/shutdown and clear error messages when llama-server is down.
+- Graceful startup/shutdown and clear error messages when the LLM backend is down.
   *(Mostly delivered: the UI surfaces an "LLM unreachable" error, stopping a
   session interrupts playback and a streaming reply instead of leaving threads to
   unwind silently, and the web server explains a busy port rather than dumping a

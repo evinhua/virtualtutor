@@ -1,19 +1,26 @@
 """VirtualTutor - real-time interactive voice conversation pipeline.
 
-Pipeline:  Microphone -> Silero VAD -> mlx-whisper (STT) -> llama.cpp (LLM)
-           -> sentence buffer -> Kokoro (TTS) -> Speakers
+Pipeline:  Microphone -> Silero VAD -> mlx-whisper (STT) -> LLM (Ollama by
+           default) -> sentence buffer -> mood -> Kokoro (TTS) -> Speakers
 
 Each stage runs in its own thread and communicates via queues, so the tutor
 can keep listening while it thinks and speaks. Speaking while the tutor talks
 triggers "barge-in": playback stops and the tutor listens to you instead.
+
+Every sentence carries a mood: either the cue the model wrote ("[gentle] Almost
+-- it is 'la cuenta'.") or one read off the sentence itself. The mood sets the
+speaking rate, pitch, loudness and how wide the avatar articulates; see
+src/emotion.py.
 """
 import json
 import os
 import queue
 import re
+import subprocess
 import sys
 import threading
 import time
+import traceback
 
 import numpy as np
 import requests
@@ -22,6 +29,7 @@ import torch
 from silero_vad import load_silero_vad
 
 import config
+import emotion
 import visemes
 from tts import KokoroTTS
 
@@ -30,8 +38,10 @@ from tts import KokoroTTS
 # ---------------------------------------------------------------------------
 raw_q: "queue.Queue[np.ndarray]" = queue.Queue()      # 512-sample mic frames
 utterance_q: "queue.Queue[np.ndarray]" = queue.Queue()  # complete user utterances
-speak_q: "queue.Queue[tuple[str, str]]" = queue.Queue()  # (sentence, lang) to speak aloud
-audio_q: "queue.Queue[tuple]" = queue.Queue()            # (audio, viseme timeline) ready to play
+# (sentence, language, mood cue or None) waiting to be spoken
+speak_q: "queue.Queue[tuple[str, str, str | None]]" = queue.Queue()
+# (audio, viseme timeline, prosody) ready to play
+audio_q: "queue.Queue[tuple]" = queue.Queue()
 
 stop_event = threading.Event()          # global shutdown
 assistant_speaking = threading.Event()  # set while TTS is playing
@@ -409,6 +419,97 @@ class ThinkFilter:
         return tail
 
 
+class CueFilter:
+    """Pulls "[excited]" mood cues out of a streamed reply, token by token.
+
+    The tutor is asked to prefix a reply with the mood it is speaking in, which
+    is what drives rate, pitch, loudness and how wide the avatar articulates
+    (see src/emotion.py). The cue is an instruction to the voice, not something
+    to say, so it must never reach TTS, the transcript or the history -- and
+    like `<think>`, it can arrive split across tokens ("[ex", "cited]").
+
+    Anything bracketed that is *not* a known mood is left alone: "(the bill)" is
+    part of what the tutor meant to say.
+    """
+
+    MAX_CUE = 24   # longer than any mood word: past this it is not a cue
+
+    # A bracketed word or two, letters only. The prompt allows nothing else in
+    # square brackets, and models invent their own cues anyway ("[natural]",
+    # "[soft voice]"), so anything cue-shaped is dropped: an unknown one leaves
+    # the mood to the sentence's own signals, which is far better than the
+    # speaker saying the word "natural".
+    CUE_SHAPED = re.compile(r"^[A-Za-z][A-Za-z \-]{1,18}$")
+
+    def __init__(self):
+        self.buffer = ""            # held-back text, always starting at '['
+        self.emotion: str | None = None   # most recent cue seen
+        self._fresh = False         # that cue has not been used by a sentence yet
+        self._eat_space = False     # drop the space a cue left behind
+
+    def take(self) -> "str | None":
+        """The cue for the sentence just finished, or None if there was no new one.
+
+        Consuming it matters: the model is asked for a cue only when the mood
+        changes, so a cue that stayed set would freeze the rest of the reply into
+        the mood of its first sentence. Later sentences fall back to their own
+        signals instead -- which is how "[warm] Say la cuenta. Want to try it?"
+        ends up warm and then curious.
+        """
+        if not self._fresh:
+            return None
+        self._fresh = False
+        return self.emotion
+
+    def _visible(self, text: str) -> str:
+        """Text to pass on, with any whitespace a cue left in front of it gone."""
+        if not self._eat_space:
+            return text
+        stripped = text.lstrip()
+        if stripped:
+            self._eat_space = False
+        return stripped
+
+    def feed(self, text: str) -> str:
+        """Add `text`; return the part that is safe to speak and show now."""
+        self.buffer += text
+        out = []
+        while self.buffer:
+            if not self.buffer.startswith("["):
+                head, bracket, rest = self.buffer.partition("[")
+                out.append(self._visible(head))
+                self.buffer = "[" + rest if bracket else ""
+                continue
+            end = self.buffer.find("]")
+            if end < 0:
+                if len(self.buffer) > self.MAX_CUE or "\n" in self.buffer:
+                    out.append(self._visible(self.buffer[0]))   # not a cue after all
+                    self.buffer = self.buffer[1:]
+                    continue
+                break                                # wait for the rest of it
+            inner = self.buffer[1:end]
+            name = emotion.canonical(inner)
+            if name:
+                self.emotion = name
+                self._fresh = True
+                self._eat_space = True
+            elif self.CUE_SHAPED.match(inner):
+                self._eat_space = True       # a cue we do not know: drop it silently
+            else:
+                out.append(self._visible(self.buffer[:end + 1]))
+            self.buffer = self.buffer[end + 1:]
+        return "".join(out)
+
+    def flush(self) -> str:
+        """End of stream: release whatever was held back and is not a cue."""
+        tail, self.buffer = self.buffer, ""
+        if tail.startswith("[") and emotion.canonical(tail[1:]):
+            self.emotion = emotion.canonical(tail[1:])
+            self._fresh = True
+            return ""
+        return self._visible(tail)
+
+
 def next_sentence(buffer: str):
     """Split the first complete sentence off `buffer`.
 
@@ -479,49 +580,62 @@ def transcribe(audio: np.ndarray) -> tuple[str, str]:
 
 
 def stream_llm(prompt: str, lang: str = config.DEFAULT_LANGUAGE):
-    """Stream the LLM reply, yielding complete sentences for TTS.
+    """Stream the LLM reply, yielding (sentence, emotion) pairs for TTS.
 
-    When the detected language differs from the previous turn, a brief system
-    hint is injected so the model switches language even when the history is
-    predominantly in a different one. The hint is ephemeral: it is removed
-    after the reply so it does not accumulate in history.
+    `emotion` is the mood cue the model wrote most recently, or None when it
+    wrote none -- in which case the mood is read off the sentence itself.
+
+    When the detected language differs from the previous turn, a brief hint is
+    added so the model switches language even when the history is predominantly
+    in a different one. It is folded into the system prompt of *this request*
+    rather than appended to the conversation: Qwen3's chat template raises
+    "System message must be at the beginning" for a system message that follows a
+    user turn, which Ollama returns as HTTP 500 rather than as a stream. Keeping
+    it out of `conversation` also means there is nothing to roll back.
     """
     global _last_llm_lang
     conversation.append({"role": "user", "content": prompt})
 
-    # Inject a language-switch hint if the student changed language.
-    lang_hint = None
-    if lang != _last_llm_lang:
+    messages = list(conversation)
+    if lang != _last_llm_lang and messages and messages[0]["role"] == "system":
         lang_names = {"en": "English", "es": "Spanish", "zh": "Chinese"}
         lang_name = lang_names.get(lang, lang)
-        lang_hint = {
-            "role": "system",
-            "content": f"The student is now speaking {lang_name}. "
-                       f"Reply in {lang_name} from now on."
-        }
-        conversation.append(lang_hint)
+        messages[0] = dict(messages[0])
+        messages[0]["content"] += (
+            f"\n\nThe student is now speaking {lang_name}. "
+            f"Reply in {lang_name} from now on.")
     _last_llm_lang = lang
 
-    payload = {
-        "messages": conversation,
-        "stream": True,
-        "temperature": config.LLM_TEMPERATURE,
-        "max_tokens": config.LLM_MAX_TOKENS,
-    }
+    payload = config.llm_payload(messages, stream=True)
     sentence = ""
     full_reply = ""
     think = ThinkFilter()
+    cues = CueFilter()
     print(f"[{config.persona_name(active_persona)}]: ", end="", flush=True)
     try:
         resp = requests.post(config.LLAMA_SERVER_URL, json=payload, stream=True, timeout=120)
     except requests.RequestException as e:
-        print(f"\n[LLM] cannot reach llama-server: {e}")
+        print(f"\n[LLM] cannot reach {config.LLM_BACKEND}: {e}")
         emit("error", text="Cannot reach the language model server. "
-                           "Start it with ./scripts/start_server.sh")
-        # Roll back: remove hint and user turn.
-        if lang_hint:
-            conversation.remove(lang_hint)
-        conversation.pop()
+                           f"{config.LLM_START_HINT}")
+        conversation.pop()          # roll back the user turn
+        return
+
+    if resp.status_code != 200:
+        # Ollama answers a refused request with a JSON body, not a stream:
+        # {"error": {"message": "model requires more system memory ...
+        detail = ""
+        try:
+            body = resp.json()
+            detail = body.get("error", body) if isinstance(body, dict) else body
+            if isinstance(detail, dict):
+                detail = detail.get("message", detail)
+        except ValueError:
+            detail = resp.text[:200]
+        print(f"\n[LLM] {config.LLM_BACKEND} returned HTTP {resp.status_code}: {detail}")
+        emit("error", text=f"The language model refused the request: {detail}")
+        resp.close()
+        conversation.pop()          # roll back the user turn
         return
 
     for line in resp.iter_lines():
@@ -537,10 +651,23 @@ def stream_llm(prompt: str, lang: str = config.DEFAULT_LANGUAGE):
             data = json.loads(decoded)
         except json.JSONDecodeError:
             continue
-        token = data["choices"][0]["delta"].get("content", "")
+        # A chunk is not guaranteed to carry text: the backend can report an
+        # error mid-stream instead (a runner that died, or a model it cannot
+        # load), and a closing chunk usually carries none. Reading the token
+        # path blind used to end the brain thread on a KeyError, which left the
+        # session listening but unable to answer.
+        error = data.get("error")
+        if error:
+            message = error.get("message", error) if isinstance(error, dict) else error
+            print(f"\n[LLM] {config.LLM_BACKEND} error mid-reply: {message}")
+            emit("error", text=f"The language model stopped: {message}")
+            break
+        token, finished = config.llm_chunk(data)
         if not token:
+            if finished:
+                break
             continue
-        token = think.feed(token)
+        token = cues.feed(think.feed(token))
         if not token:
             continue
         print(token, end="", flush=True)
@@ -549,8 +676,8 @@ def stream_llm(prompt: str, lang: str = config.DEFAULT_LANGUAGE):
         full_reply += token
         complete, sentence = next_sentence(sentence)
         if complete:
-            yield complete
-    tail = think.flush()
+            yield complete, cues.take()
+    tail = cues.feed(think.flush()) + cues.flush()
     if tail:
         print(tail, end="", flush=True)
         emit("assistant_delta", text=tail)
@@ -558,12 +685,7 @@ def stream_llm(prompt: str, lang: str = config.DEFAULT_LANGUAGE):
         full_reply += tail
     print()
     if sentence.strip() and not interrupt_event.is_set():
-        yield sentence.strip()
-
-    # Remove the ephemeral hint before storing the assistant reply, so it does
-    # not pollute the permanent history (it served its purpose for this turn).
-    if lang_hint and lang_hint in conversation:
-        conversation.remove(lang_hint)
+        yield sentence.strip(), cues.take()
 
     if full_reply.strip():
         conversation.append({"role": "assistant", "content": full_reply.strip()})
@@ -588,6 +710,12 @@ def trim_history():
 
 
 def brain_worker(gen: int):
+    """Transcribe each utterance and stream a reply into the synthesis queue.
+
+    One turn failing must not end the session: an unexpected error here used to
+    kill the thread, leaving a session that still listened, still showed "ready",
+    and could never answer again.
+    """
     while session_active(gen):
         try:
             audio = utterance_q.get(timeout=0.2)
@@ -595,20 +723,26 @@ def brain_worker(gen: int):
             continue
 
         interrupt_event.clear()
-        text, detected_lang = transcribe(audio)
-        # Transcription takes a second or two, in which the user may have
-        # pressed Stop or switched session; do not start a reply into the void.
-        if not session_active(gen):
-            return
-        if not text:
+        try:
+            text, detected_lang = transcribe(audio)
+            # Transcription takes a second or two, in which the user may have
+            # pressed Stop or switched session; do not start a reply into the void.
+            if not session_active(gen):
+                return
+            if not text:
+                emit("state", state="listening")
+                continue
+            print(f"\n[You ({detected_lang})]: {text}")
+            emit("user", text=text)
+            for sentence, mood in stream_llm(text, lang=detected_lang):
+                if interrupt_event.is_set() or not session_active(gen):
+                    break
+                speak_q.put((sentence, detected_lang, mood))
+        except Exception as e:
+            traceback.print_exc()
+            emit("error", text=f"That turn failed ({type(e).__name__}: {e}). "
+                               "Still listening -- try again.")
             emit("state", state="listening")
-            continue
-        print(f"\n[You ({detected_lang})]: {text}")
-        emit("user", text=text)
-        for sentence in stream_llm(text, lang=detected_lang):
-            if interrupt_event.is_set() or not session_active(gen):
-                break
-            speak_q.put((sentence, detected_lang))
 
 
 # ---------------------------------------------------------------------------
@@ -618,6 +752,128 @@ def drain_queue(q: queue.Queue):
     """Discard everything currently queued (used on barge-in)."""
     with q.mutex:
         q.queue.clear()
+
+
+def refresh_audio_devices():
+    """Re-read CoreAudio's device list.
+
+    PortAudio enumerates devices once, when sounddevice initializes it at import
+    time. If the default device changes after that -- headphones plugged in, a
+    Teams call taking the device over, a display with speakers waking up -- the
+    cached index is stale and starting a stream on it fails with
+    ``||PaMacCore (AUHAL)|| Unspecified Audio Hardware Error`` and
+    ``PaErrorCode -9986``. Re-initializing rebuilds the list.
+
+    Only safe while no stream is open (terminating PortAudio invalidates them),
+    so this runs at the top of start_pipeline, before the mic is opened.
+    """
+    try:
+        sd._terminate()
+        sd._initialize()
+    except Exception as e:  # never block a session on this
+        print(f"[audio] could not refresh the device list: {e}")
+
+
+def memory_pressure_hint() -> str | None:
+    """Explain a stream failure caused by memory rather than by the device.
+
+    CoreAudio wires (``mlock``) a 64 KB shared buffer per stream, and the kernel
+    refuses when there is no wirable memory left:
+
+        HALB_SharedBuffer::Lock: mlock failed: byte size 65536, errno 35
+        StartIOThread: the IO thread failed to start, Error: 2003329396
+
+    2003329396 is `'what'`, kAudioHardwareUnspecifiedError, which PortAudio
+    reports as the same `-9986` a missing device gives. Loading a large model is
+    exactly when this happens: measured here, warming a 25 GB LLM at a 131072
+    context took the machine to 3 % free with 32.1 GB of 36 GB wired, and every
+    mic open failed for the two minutes that lasted while the device itself was
+    healthy.
+
+    `memory_pressure` is what gets asked, not vm_stat's "Pages free": macOS runs
+    with free pages near zero by design, so that number says nothing about
+    whether an allocation will succeed. Returns None when memory is not the
+    likely cause, so the caller can fall back to talking about devices.
+    """
+    try:
+        out = subprocess.run(["memory_pressure", "-Q"], capture_output=True,
+                             text=True, timeout=2).stdout
+        free_pct = int(re.search(r"free percentage:\s*(\d+)", out).group(1))
+        total = int(re.search(r"system has (\d+)", out).group(1))
+    except Exception:
+        return None
+    if free_pct >= 10:
+        return None
+    wired = ""
+    try:
+        vm = subprocess.run(["vm_stat"], capture_output=True, text=True,
+                            timeout=2).stdout
+        page_size = int(re.search(r"page size of (\d+)", vm).group(1))
+        pages = int(re.search(r"Pages wired down:\s*(\d+)", vm).group(1))
+        wired = f", {pages * page_size / 2**30:.1f} GB of it wired"
+    except Exception:
+        pass
+    return (f"the machine is out of memory to lock ({free_pct}% of "
+            f"{total / 2**30:.0f} GB free{wired}), so CoreAudio cannot wire the "
+            f"buffer a stream needs. This is what loading a large model does: "
+            f"give it a minute, or cut the LLM's footprint with "
+            f"VT_LLM_CONTEXT=4096 or a smaller VT_LLM_MODEL")
+
+
+def open_stream_with_retries(factory, what: str, backoff=None):
+    """Open and start a stream, riding out CoreAudio's transient refusals.
+
+    Starting a stream on macOS fails with ``Unspecified Audio Hardware Error``
+    (`PaErrorCode -9986`) not only when the device is gone but also while the
+    audio system is briefly unable to hand it out -- measured here as 30
+    consecutive failures over 9 s on a mic that `ffmpeg -f avfoundation` could
+    record from in the same minute, and which then worked 9 times out of 9. One
+    attempt therefore says very little, which is why `backoff` gives a whole
+    sequence of them. A fresh stream is built per attempt: PortAudio does not
+    promise a stream whose start() failed is reusable.
+
+    Returns the started stream, or None if it never opened.
+    """
+    if backoff is None:
+        backoff = config.AUDIO_OPEN_BACKOFF
+    last: Exception | None = None
+    for attempt, delay in enumerate(backoff):
+        stream = None
+        try:
+            stream = factory()
+            stream.start()
+            if attempt:
+                print(f"[audio] {what} opened on attempt {attempt + 1}")
+            return stream
+        except sd.PortAudioError as e:
+            last = e
+            if stream is not None:
+                stream.close(ignore_errors=True)
+            if attempt == 0:
+                print(f"[audio] {what} busy, retrying for "
+                      f"~{sum(backoff):.0f}s...")
+            time.sleep(delay)
+    print(f"[audio] {what} did not open after {len(backoff)} attempts ({last})")
+    hint = memory_pressure_hint()
+    if hint:
+        print(f"[audio] {hint}")
+    return None
+
+
+def open_output_stream(sample_rate: int, backoff=None) -> sd.OutputStream | None:
+    """Open the speaker. Returns None so a session survives a dead output device.
+
+    Waits far less than the mic does: a sentence held up here is a sentence
+    spoken late, and the next one will try again anyway.
+    """
+    out = open_stream_with_retries(
+        lambda: sd.OutputStream(samplerate=sample_rate, channels=1, dtype="float32"),
+        "output device",
+        config.AUDIO_OPEN_BACKOFF_OUTPUT if backoff is None else backoff)
+    if out is None:
+        print("[audio] nothing will be spoken until the output device comes back. "
+              "Check System Settings > Sound.")
+    return out
 
 
 def play_interruptible(out: sd.OutputStream, audio: np.ndarray):
@@ -647,8 +903,9 @@ def synth_worker(tts: KokoroTTS, gen: int):
     far sooner than it takes to speak the previous one and the inter-sentence
     gap disappears entirely.
 
-    Each item is (audio, viseme_timeline); the timeline comes from the same
-    forward pass as the audio, so lip-sync costs nothing extra.
+    Each item is (audio, viseme_timeline, prosody); the timeline comes from the
+    same forward pass as the audio, so lip-sync costs nothing extra, and the
+    prosody tells the UI which mood the sentence was spoken in.
     """
     while session_active(gen):
         try:
@@ -657,15 +914,15 @@ def synth_worker(tts: KokoroTTS, gen: int):
             continue
         if interrupt_event.is_set():
             continue
-        # Unpack (sentence, language)
-        text, lang = item
+        # Unpack (sentence, language, mood cue or None)
+        text, lang, mood = item
         # synth_busy stays set until the audio is queued, so the player never
         # sees "both queues empty" while a sentence is still being produced.
         synth_busy.set()
         try:
-            audio, timeline = tts.synthesize_with_visemes(text, lang=lang)
-            if audio.size and not interrupt_event.is_set():
-                audio_q.put((audio, timeline))
+            speech = tts.speak(text, lang=lang, persona=active_persona, emotion=mood)
+            if speech.audio.size and not interrupt_event.is_set():
+                audio_q.put((speech.audio, speech.timeline, speech.prosody))
         except Exception as e:
             print(f"\n[TTS] synthesis error: {e}")
         finally:
@@ -684,9 +941,13 @@ def speak_worker(tts: KokoroTTS, gen: int):
     ~190 ms that closing a stream spends draining its buffer (constructing a
     stream is only ~10 ms; the drain was the real cost), measured as 690 ms vs
     500 ms of wall time to play 500 ms of audio.
+
+    The stream is opened on the first sentence rather than at startup, and a
+    device error closes it instead of ending the thread: the session keeps
+    listening and the next sentence tries to open the device again. Playback
+    used to die permanently if the device was busy at that one moment.
     """
-    out = sd.OutputStream(samplerate=tts.sample_rate, channels=1, dtype="float32")
-    out.start()
+    out: sd.OutputStream | None = None
     # Monotonic time at which the audio already handed to PortAudio finishes.
     # Used to predict when the next sentence will actually be *heard*, so the
     # browser can start the mouth animation at the right moment.
@@ -694,11 +955,23 @@ def speak_worker(tts: KokoroTTS, gen: int):
     try:
         while session_active(gen):
             try:
-                audio, timeline = audio_q.get(timeout=0.2)
+                audio, timeline, prosody = audio_q.get(timeout=0.2)
             except queue.Empty:
                 continue
             if interrupt_event.is_set():
                 continue
+
+            if out is None:
+                out = open_output_stream(tts.sample_rate)
+                playhead = 0.0
+                if out is None:
+                    # Nothing can be spoken: drop what is queued and go back to
+                    # listening rather than piling sentences up behind a dead
+                    # device.
+                    drain_queue(audio_q)
+                    assistant_speaking.clear()
+                    emit("state", state="listening")
+                    continue
 
             assistant_speaking.set()
             emit("state", state="speaking")
@@ -709,12 +982,30 @@ def speak_worker(tts: KokoroTTS, gen: int):
             now = time.monotonic()
             starts_at = max(now + out.latency, playhead)
             if timeline:
+                # `pace` lets the browser match its mouth transition times to
+                # how fast this sentence is actually spoken; `emotion` only
+                # colours the avatar. Per-span articulation is in the timeline.
                 emit("visemes",
                      start_in_ms=int(round((starts_at - now) * 1000)),
-                     timeline=visemes.to_wire(timeline))
+                     timeline=visemes.to_wire(timeline),
+                     emotion=prosody.emotion,
+                     pace=round(prosody.speed, 3))
             playhead = starts_at + audio.size / tts.sample_rate
 
-            play_interruptible(out, audio)
+            try:
+                play_interruptible(out, audio)
+            except sd.PortAudioError as e:
+                # The device went away mid-sentence (unplugged, taken over).
+                # Discard the stream; the next sentence reopens on whatever the
+                # default device is by then.
+                print(f"\n[audio] playback device error: {e}")
+                out.close(ignore_errors=True)
+                out = None
+                playhead = 0.0
+                drain_queue(audio_q)
+                assistant_speaking.clear()
+                emit("state", state="listening")
+                continue
 
             if interrupt_event.is_set():
                 # Barge-in: drop queued audio and cut playback immediately.
@@ -739,7 +1030,8 @@ def speak_worker(tts: KokoroTTS, gen: int):
                     assistant_speaking.clear()
                     emit("state", state="listening")
     finally:
-        out.close(ignore_errors=True)
+        if out is not None:
+            out.close(ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -834,6 +1126,9 @@ def start_pipeline(persona_key: str = config.DEFAULT_PERSONA, reset_history: boo
             _last_llm_lang = config.DEFAULT_LANGUAGE
 
         tts = load_tts()
+        # Before any stream is opened, so a device that changed since import is
+        # seen. Mid-session this is not safe -- it would invalidate the mic.
+        refresh_audio_devices()
         _threads = [
             threading.Thread(target=vad_worker, args=(gen,), name="vad", daemon=True),
             threading.Thread(target=brain_worker, args=(gen,), name="brain", daemon=True),
@@ -843,11 +1138,28 @@ def start_pipeline(persona_key: str = config.DEFAULT_PERSONA, reset_history: boo
         for t in _threads:
             t.start()
 
-        _input_stream = sd.InputStream(
-            samplerate=config.SAMPLE_RATE, channels=config.CHANNELS,
-            dtype="float32", blocksize=config.FRAME_SIZE, callback=audio_callback,
-        )
-        _input_stream.start()
+        _input_stream = open_stream_with_retries(
+            lambda: sd.InputStream(
+                samplerate=config.SAMPLE_RATE, channels=config.CHANNELS,
+                dtype="float32", blocksize=config.FRAME_SIZE, callback=audio_callback),
+            "microphone")
+        if _input_stream is None:
+            # Without a mic there is no session; unwind the workers we just
+            # started instead of leaving them running deaf, and clear _threads
+            # so a retry is not mistaken for "already running".
+            stop_event.set()
+            for t in _threads:
+                t.join(timeout=1.0)
+            _threads = []
+            emit("state", state="idle")
+            hint = memory_pressure_hint()
+            raise RuntimeError(
+                "could not open the microphone: " + (hint or
+                    "the audio system refused it for "
+                    f"~{sum(config.AUDIO_OPEN_BACKOFF):.0f}s. This is usually "
+                    "temporary -- press Start again. If it keeps happening, check "
+                    "the input device in System Settings > Sound")
+            )
         emit("state", state="listening")
 
 
@@ -909,6 +1221,3 @@ def main():
 if __name__ == "__main__":
     main()
 
-
-if __name__ == "__main__":
-    main()

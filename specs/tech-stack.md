@@ -20,7 +20,8 @@ fully local operation possible.
 |-------|-----------|-----------|
 | VAD (voice activity detection) | Silero VAD v5 (`silero-vad`, via `torch`) | Accurate, lightweight, fully offline end-of-speech detection at 16 kHz. The same per-frame probability also decides barge-in in full duplex. |
 | STT (speech-to-text) | `mlx-whisper` — `whisper-small` (multilingual) | Metal-accelerated Whisper on Apple Silicon; multilingual model auto-detects English, Spanish and Chinese. |
-| LLM | `llama.cpp` server + Qwen3-8B Q5_K_M (GGUF) | OpenAI-compatible streaming endpoint. Qwen3 is a hybrid reasoning model, so the server runs with `--reasoning-budget 0` and the agent strips `<think>` blocks from the stream: a spoken tutor cannot afford seconds of silent working-out. |
+| LLM | **Ollama** serving `Qwen3.8-Uncensored:latest` (27 B Qwen3, Q4_K_M); `llama.cpp` + a local GGUF as a second backend (`VT_LLM_BACKEND=llamacpp`) | Both expose the same OpenAI-compatible streaming endpoint, so only the URL, the model name and how thinking is switched off differ (`config.llm_payload`). Ollama sends `reasoning_effort: "none"` per request, llama.cpp is started with `--reasoning-budget 0`; either way the agent also strips `<think>` blocks, because a spoken tutor cannot afford seconds of silent working-out. |
+| Mood | `src/emotion.py` | Kokoro has no emotion input, so each sentence gets a mood — from a cue the model wrote, from signals in the text, or from the persona's baseline — which sets rate, pitch, loudness, the pauses around it and how wide the avatar articulates. |
 | TTS (text-to-speech) | Kokoro-82M via `mlx-audio` (24 kHz, multilingual) | Small, natural-sounding, Metal-accelerated local TTS. Voices are listed per language in `config.AVAILABLE_VOICES` and selectable at runtime; the default is `af_heart` (EN), `ef_dora` (ES), `zf_xiaoxiao` (ZH). Text is chunked and stripped of markdown before synthesis — see *Nothing reaches the speaker unsayable* under Architecture. |
 | Lip-sync | Kokoro's own duration predictor (`src/visemes.py`) | The frame count per phoneme falls out of the normal forward pass, so a frame-accurate viseme timeline costs no extra inference and no audio analysis. |
 | Frontend | Python stdlib `ThreadingHTTPServer` + Server-Sent Events, static HTML/CSS/JS | A control surface and transcript view with zero added dependencies and no build step. Audio stays in Python, which preserves the half-duplex echo handling. |
@@ -65,7 +66,8 @@ fully local operation possible.
   playback; playback is chunked to allow mid-sentence interruption.
 - **`soundfile`** — WAV read/write for the verification script.
 - **`torch`** — backend required by Silero VAD.
-- **`requests`** — streaming HTTP client for the llama.cpp OpenAI-compatible API.
+- **`requests`** — streaming HTTP client for the backend's OpenAI-compatible API
+  (Ollama by default, llama.cpp on request).
 - **`misaki[en]`, `misaki[zh]`** — grapheme-to-phoneme text processing required by Kokoro for English and Chinese.
 - **`espeak-ng`, `ffmpeg`** — system dependencies (installed via Homebrew).
 - **spaCy `en_core_web_sm`** — downloaded on first run for text processing.
@@ -92,11 +94,17 @@ fully local operation possible.
   (`tts.speakable()`), because misaki phonemizes `*` as the word "asterisk": an
   emphasised `*boss*` is otherwise spoken as "asterisk boss asterisk".
 - **Reasoning is off, and filtered anyway.** Qwen3 thinks before answering by
-  default, which is dead air in a voice loop. The server closes thinking
-  immediately (`--reasoning-budget 0`) and `ThinkFilter` strips `<think>` blocks
-  from the token stream, matching tags split across tokens — whether they reach
-  the client at all depends on llama.cpp's `--reasoning-format`, so the client
-  cannot assume they will not.
+  default, which is dead air in a voice loop. Thinking is closed immediately per
+  request on Ollama (`reasoning_effort: "none"`) or at startup on llama.cpp
+  (`--reasoning-budget 0`), and `ThinkFilter` strips `<think>` blocks from the
+  token stream, matching tags split across tokens — Ollama keeps reasoning in a
+  separate `reasoning` delta the agent never reads, but llama.cpp can land the
+  tags in the reply text, so the client cannot assume they will not appear.
+- **Mood cues never reach the speaker.** The model is asked to prefix a reply
+  with `[excited]` or `[gentle]`; `CueFilter` pulls that out of the stream before
+  anything is spoken, shown or stored, and drops cue-shaped words it invented
+  (`[natural]`) rather than reading them aloud. A cue applies to the sentence it
+  introduces, after which the text's own signals take over again.
 - **Half-duplex by default.** The agent does not listen while speaking and
   flushes echo picked up during playback. Full duplex (barge-in) is opt-in and
   assumes headphones.
@@ -172,7 +180,7 @@ fully local operation possible.
   env-var voice outside the curated list is added to it rather than ignored, so
   the dialog still offers it. `AVAILABLE_VOICES` in the same file is the only
   place the selectable voices are defined; `/api/config` serves it to the UI.
-- **Deployment model:** local single-user. Both the llama.cpp server and the web
+- **Deployment model:** local single-user. Both the LLM backend and the web
   UI bind to `127.0.0.1` only, with **no authentication** — anyone who can reach
   the web UI could start the microphone, so it must not be exposed to a network
   without adding access controls.
@@ -181,7 +189,8 @@ fully local operation possible.
   `scripts/start_server.sh` (Metal GPU LLM server), `scripts/start_agent.sh`
   (CLI voice agent), `scripts/start_web.sh` (web frontend).
 - **Verification:** `src/verify.py` checks imports, VAD, TTS synthesis, a Whisper
-  round-trip, and llama-server reachability — no microphone required.
+  round-trip, that the moods change rate, pitch and articulation without
+  drifting out of lip-sync, and LLM backend reachability — no microphone required.
 - **Generated artifacts stay out of git** — GGUF weights and sample audio are
   gitignored. The photo avatar sprites are the exception: at ~200 KB they are
   committed, so a clone shows the real face without needing the source clip,

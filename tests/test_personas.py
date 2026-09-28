@@ -1,7 +1,9 @@
 """Tests for persona prompt composition.
 
-A persona is a personality layer on top of the shared tutoring rules, and the
-rules (short spoken answers, no markdown) must survive every persona.
+Most personas are a personality layer on top of the shared tutoring rules; the
+secretary brings its own base rules instead. Either way the parts that are not
+personality -- the three subjects, short spoken answers, no markdown, replying
+in the student's language -- must survive every persona.
 """
 import pytest
 
@@ -17,8 +19,17 @@ def test_every_persona_has_menu_metadata(key):
 @pytest.mark.parametrize("key", sorted(config.PERSONAS))
 def test_prompt_keeps_the_base_rules_and_adds_the_style(key):
     prompt = config.build_system_prompt(key)
-    assert config.BASE_SYSTEM_PROMPT in prompt
+    assert config.persona_base_prompt(key) in prompt
     assert config.PERSONAS[key]["style"] in prompt
+
+
+def test_shared_personas_are_built_on_the_shared_rules():
+    """Only a persona that declares its own prompt leaves the shared base."""
+    for key, persona in config.PERSONAS.items():
+        if persona.get("prompt"):
+            continue
+        assert config.persona_base_prompt(key) == config.BASE_SYSTEM_PROMPT
+        assert config.BASE_SYSTEM_PROMPT in config.build_system_prompt(key)
 
 
 @pytest.mark.parametrize("key", sorted(config.PERSONAS))
@@ -48,28 +59,32 @@ def test_default_persona_exists():
     assert config.DEFAULT_PERSONA in config.PERSONAS
 
 
-def test_base_rules_are_tts_safe():
-    rules = config.BASE_SYSTEM_PROMPT.lower()
+@pytest.mark.parametrize("key", sorted(config.PERSONAS))
+def test_base_rules_are_tts_safe(key):
+    rules = config.persona_base_prompt(key).lower()
     for constraint in ("no markdown", "no lists", "no emojis"):
         assert constraint in rules
 
 
-def test_base_rules_name_the_three_subjects():
+@pytest.mark.parametrize("key", sorted(config.PERSONAS))
+def test_base_rules_name_the_three_subjects(key):
     """The tutor teaches language, culture and travel -- not arbitrary homework."""
-    rules = config.BASE_SYSTEM_PROMPT.lower()
+    rules = config.persona_base_prompt(key).lower()
     for topic in ("language", "culture", "travel"):
         assert topic in rules
 
 
-def test_pronunciation_guidance_stays_speakable():
+@pytest.mark.parametrize("key", sorted(config.PERSONAS))
+def test_pronunciation_guidance_stays_speakable(key):
     """Phonetic symbols or spelled-out letters are unusable through TTS."""
-    rules = config.BASE_SYSTEM_PROMPT.lower()
+    rules = config.persona_base_prompt(key).lower()
     assert "spoken syllables" in rules
     assert "never as phonetic symbols" in rules
 
 
-def test_language_mirroring_survives_the_topic_change():
-    rules = config.BASE_SYSTEM_PROMPT
+@pytest.mark.parametrize("key", sorted(config.PERSONAS))
+def test_language_mirroring_survives_the_topic_change(key):
+    rules = config.persona_base_prompt(key)
     assert "same language the student uses" in rules
     for language in ("Spanish", "Chinese"):
         assert language in rules
@@ -88,5 +103,31 @@ def test_secretary_persona_is_offered():
     assert "secretary" in config.PERSONAS
     assert config.persona_name("secretary") == "The Sassy Secretary"
     prompt = config.build_system_prompt("secretary")
-    assert config.BASE_SYSTEM_PROMPT in prompt      # still a tutor underneath
     assert "sassy" in prompt.lower()
+
+
+def test_secretary_has_its_own_base_prompt():
+    """It replaces the shared rules rather than layering on them."""
+    base = config.persona_base_prompt("secretary")
+    assert base == config.SECRETARY_SYSTEM_PROMPT
+    assert base != config.BASE_SYSTEM_PROMPT
+    prompt = config.build_system_prompt("secretary")
+    assert config.BASE_SYSTEM_PROMPT not in prompt
+    assert config.SECRETARY_SYSTEM_PROMPT in prompt
+
+
+def test_secretary_prompt_is_written_in_its_own_frame():
+    """Independent, but still a tutor: the boss/diary framing, and the lesson."""
+    base = config.SECRETARY_SYSTEM_PROMPT.lower()
+    assert "virtualtutor" in base
+    assert "secretary" in base
+    for word in ("boss", "diary", "agenda", "filed"):
+        assert word in base
+
+
+def test_secretary_style_stays_the_delivery_layer():
+    """The style describes the voice; the subjects live in the prompt."""
+    style = config.PERSONAS["secretary"]["style"]
+    assert "deadpan" in style.lower()
+    assert "affectionate and professional" in style
+
