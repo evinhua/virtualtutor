@@ -22,10 +22,16 @@
         <span class="persona-label">Persona</span>
         <select id="persona" aria-label="Tutor persona"></select>
       </label>
-      <p class="status">
-        <span id="status-dot" class="dot" aria-hidden="true"></span>
-        <span id="status-text" role="status" aria-live="polite">Idle</span>
-      </p>
+      <div class="head-right">
+        <p class="status">
+          <span id="status-dot" class="dot" aria-hidden="true"></span>
+          <span id="status-text" role="status" aria-live="polite">Idle</span>
+        </p>
+        <button id="config-open" class="ghost" type="button" aria-haspopup="dialog">
+          <span class="gear" aria-hidden="true">&#9881;</span>
+          <span>Configuration</span>
+        </button>
+      </div>
     </div>
 
     <div class="stage">
@@ -44,6 +50,38 @@
 
   <p id="error" class="error" role="alert" hidden></p>
 </main>
+
+<!-- Configuration: TTS voice per language and duplex mode. Changes are applied
+     immediately, mid-session included, so there is no Save button. -->
+<dialog id="config-dialog" class="modal" aria-labelledby="config-title">
+  <div class="modal-head">
+    <h2 id="config-title">Configuration</h2>
+    <button id="config-close" class="modal-x" type="button" aria-label="Close configuration">&times;</button>
+  </div>
+
+  <div class="modal-body">
+    <section class="group">
+      <h3 class="group-title">Voices</h3>
+      <p class="hint">Kokoro voice for each spoken language. Applies to the tutor&rsquo;s next sentence.</p>
+      <div id="voice-fields" class="fields"></div>
+    </section>
+
+    <section class="group">
+      <h3 class="group-title">Duplex mode</h3>
+      <div class="switch-row">
+        <span class="switch-text">
+          <label class="switch-name" for="duplex">Full duplex (barge-in)</label>
+          <span class="hint">Keep listening while the tutor speaks, so you can interrupt it.
+            Use headphones &mdash; on speakers the tutor hears itself and cuts its own reply short.
+            Off means half duplex: the mic is muted while it speaks.</span>
+        </span>
+        <input id="duplex" class="switch" type="checkbox" role="switch">
+      </div>
+    </section>
+
+    <p id="config-error" class="error" role="alert" hidden></p>
+  </div>
+</dialog>
 
 <script src="/app.js"></script>
 </body>

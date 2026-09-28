@@ -13,6 +13,12 @@ const el = {
   statusDot: document.getElementById("status-dot"),
   persona: document.getElementById("persona"),
   error: document.getElementById("error"),
+  configOpen: document.getElementById("config-open"),
+  configClose: document.getElementById("config-close"),
+  configDialog: document.getElementById("config-dialog"),
+  configError: document.getElementById("config-error"),
+  voiceFields: document.getElementById("voice-fields"),
+  duplex: document.getElementById("duplex"),
 };
 
 const STATUS_TEXT = {
@@ -114,6 +120,114 @@ el.persona.addEventListener("change", async () => {
   }
 });
 
+/* --- configuration dialog -----------------------------------------------
+   Voice per language and half/full duplex. Both are read by the pipeline as it
+   runs -- the voice per synthesized sentence, the duplex mode per mic frame --
+   so every change applies at once and there is nothing to save.
+------------------------------------------------------------------------- */
+const config = (() => {
+  const selects = new Map();   // language code -> <select>
+
+  function showConfigError(message) {
+    el.configError.textContent = message;
+    el.configError.hidden = false;
+  }
+
+  function clearConfigError() {
+    el.configError.hidden = true;
+  }
+
+  /** Build one labelled select per language served by /api/config. */
+  function renderVoices(languages) {
+    el.voiceFields.textContent = "";
+    selects.clear();
+    for (const lang of languages) {
+      const row = document.createElement("label");
+      row.className = "field";
+
+      const name = document.createElement("span");
+      name.textContent = lang.label;
+      row.appendChild(name);
+
+      const select = document.createElement("select");
+      for (const voice of lang.voices) {
+        const opt = document.createElement("option");
+        opt.value = voice;
+        opt.textContent = voice;
+        select.appendChild(opt);
+      }
+      select.value = lang.voice;
+      select.addEventListener("change", () => apply({ voices: { [lang.code]: select.value } }));
+      row.appendChild(select);
+
+      selects.set(lang.code, select);
+      el.voiceFields.appendChild(row);
+    }
+  }
+
+  /** Reflect server state in the controls, so it is never merely optimistic. */
+  function render(state) {
+    if (state.languages) {
+      if (selects.size === state.languages.length) {
+        // Same set of languages: only update values, so an open dropdown and
+        // keyboard focus survive a change made in another tab.
+        for (const lang of state.languages) {
+          const select = selects.get(lang.code);
+          if (select) select.value = lang.voice;
+        }
+      } else {
+        renderVoices(state.languages);
+      }
+    }
+    if (state.duplex) el.duplex.checked = state.duplex === "full";
+  }
+
+  async function apply(patch) {
+    clearConfigError();
+    try {
+      render(await post("/api/config", patch));
+    } catch (err) {
+      showConfigError(err.message);
+      // Put the controls back to what the server actually has.
+      load().catch(() => {});
+    }
+  }
+
+  async function load() {
+    render(await (await fetch("/api/config")).json());
+  }
+
+  el.duplex.addEventListener("change", () =>
+    apply({ duplex: el.duplex.checked ? "full" : "half" }));
+
+  el.configOpen.addEventListener("click", () => {
+    clearConfigError();
+    // Re-read on open: the CLI or another tab may have changed something.
+    load().catch(() => showConfigError("Cannot reach the VirtualTutor server."));
+    if (typeof el.configDialog.showModal === "function") el.configDialog.showModal();
+    else el.configDialog.setAttribute("open", "");   // very old Safari
+  });
+
+  el.configClose.addEventListener("click", () => el.configDialog.close());
+
+  // Click outside the card closes it, matching the Esc key <dialog> gives us.
+  el.configDialog.addEventListener("click", (e) => {
+    if (e.target === el.configDialog) el.configDialog.close();
+  });
+
+  return {
+    load,
+    /** Apply a change that came from the server (another tab, or the CLI). */
+    setVoice(lang, voice) {
+      const select = selects.get(lang);
+      if (select && voice) select.value = voice;
+    },
+    setDuplex(mode) {
+      el.duplex.checked = mode === "full";
+    },
+  };
+})();
+
 el.toggle.addEventListener("click", async () => {
   if (busy) return;
   busy = true;
@@ -171,7 +285,8 @@ function connectEvents() {
         finishTutorTurn();
         break;
       case "visemes":
-        avatar.speak(event.start_in_ms, event.timeline);
+        avatar.speak(event.start_in_ms, event.timeline,
+                     { emotion: event.emotion, pace: event.pace });
         break;
       case "interrupted":
         finishTutorTurn();
@@ -179,6 +294,14 @@ function connectEvents() {
         break;
       case "level":
         waves.setLevel(event.value);
+        break;
+      // Config changes are broadcast, so a second tab does not show stale
+      // settings after one of them changes a voice or the duplex mode.
+      case "voice":
+        config.setVoice(event.lang, event.voice);
+        break;
+      case "duplex":
+        config.setDuplex(event.mode);
         break;
       case "error":
         showError(event.text);
@@ -307,9 +430,13 @@ const waves = (() => {
 
 /* --- avatar --------------------------------------------------------------
    Draws a face whose mouth follows the viseme timeline produced by Kokoro.
-   The server sends [[start_ms, viseme], ...] plus start_in_ms, the delay until
-   the audio is actually audible (PortAudio buffer + anything still playing),
-   so the mouth lines up with what you hear even though audio plays server-side.
+   The server sends [[start_ms, viseme, level], ...] plus start_in_ms, the delay
+   until the audio is actually audible (PortAudio buffer + anything still
+   playing), so the mouth lines up with what you hear even though audio plays
+   server-side. `level` is how far the mouth should travel toward that shape
+   (stress plus the sentence's mood); a two-element entry means 1. The event also
+   carries the mood and its speaking rate, which colour the ring and set how
+   quickly the mouth moves.
 
    If web/avatar/manifest.json exists (built by tools/build_photo_avatar.py) a
    photo avatar is used: one base face plus a small mouth patch per viseme,
@@ -374,9 +501,45 @@ const avatar = (() => {
   const MAX_LAYERS = 3;      // strongest shapes blended per frame
   const WEIGHT_FLOOR = 0.02; // below this a shape is dropped from the blend
 
+  /* Mood.
+
+     The server sends the mood each sentence was spoken in, plus `pace` (its
+     speaking-rate multiplier) and a per-span articulation level. The level is
+     applied as openness rather than as weight: weights are normalised before
+     rendering, so scaling them all would cancel out, whereas biasing the blend
+     between the mouth shapes and silence really does open or close the mouth.
+
+     Pace scales the transition times, so a fast, excited sentence gets snappier
+     articulation and a slow, thoughtful one gets softer movement -- the same
+     relationship speech has between rate and coarticulation. */
+  const MOOD_HUE = {
+    neutral: 268, warm: 28, excited: 330, amused: 300, curious: 196,
+    gentle: 158, thoughtful: 236, proud: 46, deadpan: 250,
+  };
+
+  // Brow raise and inward slant per mood, as fractions of head size. Only the
+  // drawn face uses these; the photo avatar's face comes from the video, so its
+  // share of the mood is the ring colour and how wide the mouth articulates.
+  const MOOD_BROW = {
+    neutral: { raise: 0.00, tilt: 0.00 },
+    warm: { raise: 0.02, tilt: 0.02 },
+    excited: { raise: 0.09, tilt: 0.04 },
+    amused: { raise: 0.06, tilt: -0.05 },
+    curious: { raise: 0.07, tilt: 0.08 },
+    gentle: { raise: -0.02, tilt: 0.06 },
+    thoughtful: { raise: -0.04, tilt: -0.06 },
+    proud: { raise: 0.05, tilt: 0.00 },
+    deadpan: { raise: -0.05, tilt: -0.02 },
+  };
+
   let photo = null;          // { base, patches, mask, mix, manifest } once loaded
   let weights = { sil: 1 };  // viseme -> 0..1 contribution to the current mouth
   let lastFrameAt = performance.now();
+  let mood = "neutral";      // mood of the sentence being spoken
+  let pace = 1;              // its speaking-rate multiplier
+  let level = 1;             // articulation of the span being spoken
+  let shownLevel = 1;        // eased, so a mood change does not jump the mouth
+  let brow = { raise: 0, tilt: 0 };   // eased brow pose of the drawn face
 
   /** Alpha mask matching build_photo_avatar.py's mouth_mask, in patch space. */
   function buildMask(manifest) {
@@ -451,7 +614,8 @@ const avatar = (() => {
 
   function lerp(a, b, t) { return a + (b - a) * t; }
 
-  /** Viseme that should be visible at `now`, following the timeline. */
+  /** Viseme that should be visible at `now`, following the timeline.
+      Also latches the articulation level of that span (default 1). */
   function visemeAt(now) {
     if (!timeline.length) return "sil";
     const t = now - startAt;
@@ -461,15 +625,19 @@ const avatar = (() => {
     while (cursor > 0 && timeline[cursor][0] > t) cursor--;
     if (t > timeline[timeline.length - 1][0]) {          // utterance finished
       timeline = [];
+      level = 1;
       return "sil";
     }
-    return timeline[cursor][1] || "sil";
+    const span = timeline[cursor];
+    level = Number.isFinite(span[2]) ? span[2] : 1;
+    return span[1] || "sil";
   }
 
   /** Advance each viseme's weight toward its target for a `dt` ms frame. */
   function updateWeights(target, dt) {
-    const attack = reduceMotion ? 1 : 1 - Math.exp(-dt / ATTACK_MS);
-    const decay = reduceMotion ? 0 : Math.exp(-dt / RELEASE_MS);
+    // Faster speech moves the lips faster; `pace` is the sentence's rate.
+    const attack = reduceMotion ? 1 : 1 - Math.exp(-dt * pace / ATTACK_MS);
+    const decay = reduceMotion ? 0 : Math.exp(-dt * pace / RELEASE_MS);
     weights[target] = (weights[target] || 0) + (1 - (weights[target] || 0)) * attack;
     for (const v in weights) {
       if (v === target) continue;
@@ -477,6 +645,9 @@ const avatar = (() => {
       if (w < WEIGHT_FLOOR) delete weights[v];
       else weights[v] = w;
     }
+    // Ease the articulation level so it never steps between two spans.
+    const k = reduceMotion ? 1 : 1 - Math.exp(-dt / 70);
+    shownLevel = lerp(shownLevel, timeline.length ? level : 1, k);
     return weights;
   }
 
@@ -491,10 +662,29 @@ const avatar = (() => {
     return layers.map(([v, w]) => [v, w / total]);
   }
 
+  /** Bias a blend toward a wider or a more closed mouth.
+
+      This is how the articulation level reaches the photo avatar, which cannot
+      be stretched geometrically: an over-articulated sentence mixes in a little
+      of the wide-open shape, a mumbled one a little of the closed one. Scaling
+      the weights themselves would do nothing, since they are normalised. */
+  function articulate(layers, available) {
+    const bias = shownLevel - 1;
+    if (Math.abs(bias) < 0.02 || !layers.length) return layers;
+    const extra = bias > 0 ? "aa" : "sil";
+    if (available && !available[extra]) return layers;
+    const share = Math.min(0.35, Math.abs(bias));
+    const out = layers.map(([v, w]) => [v, w * (1 - share)]);
+    const existing = out.find(([v]) => v === extra);
+    if (existing) existing[1] += share;
+    else out.push([extra, share]);
+    return out;
+  }
+
   /** Photo avatar: base face + a blend of the strongest mouth patches. */
   function drawPhoto(now, dt) {
     updateWeights(visemeAt(now), dt);
-    const layers = blendLayers(photo.patches);
+    const layers = articulate(blendLayers(photo.patches), photo.patches);
     const p = photo.manifest.patch;
     const k = size / photo.manifest.size;        // exported px -> CSS px
 
@@ -537,7 +727,10 @@ const avatar = (() => {
   }
 
   function stateHue() {
-    return state === "speaking" ? 268 : state === "thinking" ? 38
+    // While speaking, the ring takes the mood's colour instead of the generic
+    // "speaking" purple, so the mood is visible and not only audible.
+    if (state === "speaking") return MOOD_HUE[mood] ?? 268;
+    return state === "thinking" ? 38
       : state === "hearing" ? 214 : state === "listening" ? 168 : 218;
   }
 
@@ -562,6 +755,12 @@ const avatar = (() => {
       tgt.h += m.h * weight;
       tgt.r += m.r * weight;
     }
+    // Articulation: the drawn face can simply open wider, where the photo
+    // avatar has to mix in another mouth patch. Width moves less than height,
+    // as it does in speech.
+    const open = Math.max(0.5, Math.min(1.6, shownLevel));
+    tgt.h *= open;
+    tgt.w *= 1 + (open - 1) * 0.35;
     // A little extra easing on top, time-based rather than per-frame.
     const k = reduceMotion ? 1 : 1 - Math.exp(-dt / 45);
     shape.w = lerp(shape.w, tgt.w, k);
@@ -606,6 +805,26 @@ const avatar = (() => {
       ctx.fill();
     }
 
+    // Brows: the drawn face's share of the mood. Raised and slanted inward for
+    // excitement or curiosity, lowered and flattened for deadpan -- eased, so
+    // the expression settles into a sentence rather than snapping per span.
+    const target = MOOD_BROW[mood] || MOOD_BROW.neutral;
+    const bk = reduceMotion ? 1 : 1 - Math.exp(-dt / 220);
+    brow.raise = lerp(brow.raise, target.raise, bk);
+    brow.tilt = lerp(brow.tilt, target.tilt, bk);
+    ctx.strokeStyle = "#12203a";
+    ctx.lineWidth = Math.max(1.5, head * 0.055);
+    ctx.lineCap = "round";
+    for (const side of [-1, 1]) {
+      const bx = c + side * eyeDx;
+      const by = eyeY - head * (0.24 + brow.raise);
+      const half = head * 0.16;
+      ctx.beginPath();
+      ctx.moveTo(bx - half, by + head * brow.tilt * side);
+      ctx.lineTo(bx + half, by - head * brow.tilt * side);
+      ctx.stroke();
+    }
+
     // Mouth: an ellipse whose height and roundness come from the viseme.
     const mw = head * shape.w;
     const mh = Math.max(size * 0.006, head * shape.h);
@@ -632,12 +851,21 @@ const avatar = (() => {
 
   return {
     setState(next) { state = next; },
-    speak(startInMs, wire) {
+    /** Start a sentence. `info` carries its mood and speaking rate. */
+    speak(startInMs, wire, info) {
       timeline = Array.isArray(wire) ? wire : [];
       cursor = 0;
       startAt = performance.now() + (Number(startInMs) || 0);
+      mood = (info && MOOD_BROW[info.emotion]) ? info.emotion : "neutral";
+      pace = Math.max(0.6, Math.min(1.6, Number(info && info.pace) || 1));
     },
-    silence() { timeline = []; cursor = 0; },
+    silence() {
+      timeline = [];
+      cursor = 0;
+      level = 1;
+      pace = 1;
+      mood = "neutral";
+    },
   };
 })();
 
@@ -658,6 +886,7 @@ async function init() {
     el.persona.value = persona || fallback;
     setRunning(live);
     setStatus(live ? "listening" : "idle");
+    await config.load();
   } catch {
     showError("Cannot reach the VirtualTutor server.");
   }

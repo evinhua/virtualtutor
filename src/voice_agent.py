@@ -1,19 +1,26 @@
 """VirtualTutor - real-time interactive voice conversation pipeline.
 
-Pipeline:  Microphone -> Silero VAD -> mlx-whisper (STT) -> llama.cpp (LLM)
-           -> sentence buffer -> Kokoro (TTS) -> Speakers
+Pipeline:  Microphone -> Silero VAD -> mlx-whisper (STT) -> LLM (Ollama by
+           default) -> sentence buffer -> mood -> Kokoro (TTS) -> Speakers
 
 Each stage runs in its own thread and communicates via queues, so the tutor
 can keep listening while it thinks and speaks. Speaking while the tutor talks
 triggers "barge-in": playback stops and the tutor listens to you instead.
+
+Every sentence carries a mood: either the cue the model wrote ("[gentle] Almost
+-- it is 'la cuenta'.") or one read off the sentence itself. The mood sets the
+speaking rate, pitch, loudness and how wide the avatar articulates; see
+src/emotion.py.
 """
 import json
 import os
 import queue
 import re
+import subprocess
 import sys
 import threading
 import time
+import traceback
 
 import numpy as np
 import requests
@@ -22,6 +29,7 @@ import torch
 from silero_vad import load_silero_vad
 
 import config
+import emotion
 import visemes
 from tts import KokoroTTS
 
@@ -30,8 +38,10 @@ from tts import KokoroTTS
 # ---------------------------------------------------------------------------
 raw_q: "queue.Queue[np.ndarray]" = queue.Queue()      # 512-sample mic frames
 utterance_q: "queue.Queue[np.ndarray]" = queue.Queue()  # complete user utterances
-speak_q: "queue.Queue[str]" = queue.Queue()             # sentences to speak aloud
-audio_q: "queue.Queue[tuple]" = queue.Queue()            # (audio, viseme timeline) ready to play
+# (sentence, language, mood cue or None) waiting to be spoken
+speak_q: "queue.Queue[tuple[str, str, str | None]]" = queue.Queue()
+# (audio, viseme timeline, prosody) ready to play
+audio_q: "queue.Queue[tuple]" = queue.Queue()
 
 stop_event = threading.Event()          # global shutdown
 assistant_speaking = threading.Event()  # set while TTS is playing
@@ -59,6 +69,9 @@ conversation = [{"role": "system", "content": config.SYSTEM_PROMPT}]
 # Persona currently in force. Kept here (not just in the system prompt) so the
 # CLI, the web UI and the transcript can all label replies correctly.
 active_persona = config.PERSONA
+# Last language the LLM replied in. Used to detect language switches and inject
+# a hint so the model follows the new language despite history in the old one.
+_last_llm_lang = config.DEFAULT_LANGUAGE
 # History is trimmed in blocks rather than every turn. Dropping the oldest
 # message each turn changes the token prefix after the system prompt, which
 # invalidates llama.cpp's KV cache and forces a full re-prefill of the whole
@@ -69,7 +82,18 @@ active_persona = config.PERSONA
 HISTORY_HIGH_WATER = 24  # messages after the system prompt before trimming
 HISTORY_LOW_WATER = 12   # messages kept after a trim
 
-SENTENCE_END = re.compile(r"[.!?;:]+[\s\"')\]]*\s|[\n]+")
+# ASCII terminators only count when followed by whitespace, so "3.14" and
+# mid-word colons do not split the stream early. CJK terminators are
+# unambiguous and Chinese text carries no spaces, so they split on their own
+# (together with any closing quote or bracket). Without them a whole Chinese
+# reply arrived as one chunk, which Kokoro then truncated mid-sentence.
+SENTENCE_END = re.compile(
+    r"[.!?;:]+[\s\"')\]]*\s"
+    r"|[\u3002\uff01\uff1f\uff1b\uff1a\u2026]+"
+    r"(?![\u201c\u2018\u300c\u300e\uff08])"          # not a colon introducing a quote
+    r"[\u201d\u2019\u300d\u300f\uff09]*"
+    r"|[\n]+"
+)
 
 # ---------------------------------------------------------------------------
 # Session generation
@@ -101,6 +125,29 @@ def set_persona(persona_key: str) -> str:
     return persona_key
 
 
+def set_voice(lang: str, voice: str) -> str:
+    """Change the TTS voice for one language. Returns the voice in force.
+
+    Safe mid-session: tts.py resolves the voice per sentence, so the change
+    lands on the tutor's next sentence without reloading anything. A sentence
+    already synthesized keeps the old voice.
+    """
+    applied = config.set_voice(lang, voice)
+    emit("voice", lang=lang, voice=applied)
+    return applied
+
+
+def set_duplex_mode(mode: str) -> str:
+    """Switch between half and full duplex. Returns the mode in force.
+
+    Full duplex arms barge-in, which needs headphones: on speakers the tutor's
+    own voice re-enters the mic and interrupts it mid-reply.
+    """
+    applied = config.set_duplex_mode(mode)
+    emit("duplex", mode=applied)
+    return applied
+
+
 
 # ---------------------------------------------------------------------------
 # 1. Microphone capture
@@ -114,26 +161,66 @@ def audio_callback(indata, frames, time_info, status):
 # ---------------------------------------------------------------------------
 # 2. Voice Activity Detection
 # ---------------------------------------------------------------------------
+class BargeInDetector:
+    """Decides whether sound picked up during playback is a real interruption.
+
+    Evidence accumulates instead of having to be consecutive. Speech dips below
+    the VAD threshold between words and on plosives, and a consecutive-frame
+    counter starts over on every dip: measured on synthesized speech at a normal
+    speaking level, that counter never fired at all for "Stop." or "Wait!" and
+    took 1.66 s to fire on a whole sentence, so the tutor talked over the user
+    and the interruption was usually missed outright. Scoring with decay fires
+    the same cases in 0.61-0.83 s.
+
+    A lone spike -- a keypress, a door, one loud burst of echo -- still cannot
+    interrupt, because it decays away before reaching the threshold.
+    """
+
+    def __init__(self):
+        self.needed = max(1, int(config.BARGE_IN_SPEECH_DURATION
+                                 * config.SAMPLE_RATE / config.FRAME_SIZE))
+        self.score = 0.0
+        self.fired = False
+
+    def reset(self):
+        self.score = 0.0
+        self.fired = False
+
+    def feed(self, is_speech: bool, rms: float) -> bool:
+        """Add one frame. Returns True once: on the frame that confirms it."""
+        if is_speech and rms >= config.BARGE_IN_MIN_RMS:
+            self.score = min(float(self.needed), self.score + 1.0)
+        else:
+            self.score = max(0.0, self.score - config.BARGE_IN_DECAY)
+        if self.fired or self.score < self.needed:
+            return False
+        self.fired = True
+        return True
+
+
 def vad_worker(gen: int):
     """Detect speech segments and enqueue complete utterances.
 
-    While the assistant is speaking, detected speech triggers barge-in instead
-    of being recorded, so the tutor stops talking and waits for the new query.
+    Half duplex (the default) ignores the mic while the tutor speaks. Full duplex
+    keeps listening, and sustained speech interrupts the tutor: playback stops
+    and the words that caused the interruption start the new utterance, rather
+    than being thrown away with the echo.
     """
     vad = load_silero_vad()
     max_silence = int(config.VAD_SILENCE_DURATION * config.SAMPLE_RATE / config.FRAME_SIZE)
     min_speech = int(config.VAD_MIN_SPEECH_DURATION * config.SAMPLE_RATE / config.FRAME_SIZE)
     preroll_len = max(1, int(config.VAD_PREROLL_DURATION * config.SAMPLE_RATE / config.FRAME_SIZE))
-    # consecutive loud speech frames needed to treat sound as a real interruption
-    barge_in_frames = int(0.4 * config.SAMPLE_RATE / config.FRAME_SIZE)
+    # Enough history to also cover the audio a barge-in takes to confirm.
+    history_len = max(preroll_len, int(config.BARGE_IN_PREROLL_DURATION
+                                       * config.SAMPLE_RATE / config.FRAME_SIZE))
 
     from collections import deque
-    preroll = deque(maxlen=preroll_len)  # recent frames captured before speech starts
+    preroll = deque(maxlen=history_len)  # recent frames captured before speech starts
+    barge = BargeInDetector()
     buffer: list[np.ndarray] = []
     speaking = False
     silence = 0
-    speech_run = 0
-    was_assistant_speaking = False
+    mic_was_muted = False    # half duplex closed the mic while the tutor spoke
     # Emit a mic level roughly 10x/second rather than once per 512-sample frame.
     level_every = max(1, int(config.SAMPLE_RATE / config.FRAME_SIZE / 10))
     level_ticks = 0
@@ -149,53 +236,67 @@ def vad_worker(gen: int):
         except queue.Empty:
             continue
 
-        # When the tutor JUST stopped speaking, discard echo/tail that leaked into
-        # the mic during playback so it is not mistaken for (or merged into) speech.
-        if was_assistant_speaking and not assistant_speaking.is_set():
+        tutor_speaking = assistant_speaking.is_set()
+
+        # --- Half duplex: the mic is closed while the tutor speaks ---------
+        if tutor_speaking and not config.ENABLE_BARGE_IN:
+            mic_was_muted = True
+            continue
+
+        # Echo and the tail of the tutor's own voice leaked in while the mic was
+        # muted; drop it before listening, or it is merged into the next
+        # utterance. Only reachable in half duplex -- in full duplex the mic was
+        # never muted, and flushing would discard the interruption just captured.
+        if mic_was_muted:
             flush_input()
             preroll.clear(); buffer = []
-            speaking = False; silence = 0; speech_run = 0
+            speaking = False; silence = 0
+            barge.reset()
             vad.reset_states()
-            was_assistant_speaking = False
+            mic_was_muted = False
             continue
 
-        # --- While the tutor is speaking: half-duplex, optional barge-in ---
-        if assistant_speaking.is_set():
-            was_assistant_speaking = True
-            if config.ENABLE_BARGE_IN:
-                rms = float(np.sqrt(np.mean(np.square(frame))))
-                prob = vad(torch.from_numpy(frame), config.SAMPLE_RATE).item()
-                if prob >= config.VAD_THRESHOLD and rms >= config.BARGE_IN_MIN_RMS:
-                    speech_run += 1
-                    if speech_run >= barge_in_frames:
-                        print("\n[VAD] barge-in detected -> interrupting tutor")
-                        interrupt_event.set()
-                        drain_queue(speak_q)
-                        drain_queue(audio_q)
-                        emit("interrupted")
-                        speech_run = 0
-                else:
-                    speech_run = 0
-            continue
-
-        # --- Normal listening --------------------------------------------
         preroll.append(frame)
         prob = vad(torch.from_numpy(frame), config.SAMPLE_RATE).item()
         is_speech = prob >= config.VAD_THRESHOLD
+        rms = float(np.sqrt(np.mean(np.square(frame))))
 
-        # Feed the UI a coarse input level (~10 Hz) to drive the background waves.
+        # Feed the UI a coarse input level (~10 Hz) to drive the background
+        # waves. Emitted during playback too, so full duplex visibly shows that
+        # the mic is still open while the tutor talks.
         level_ticks += 1
         if level_ticks >= level_every:
             level_ticks = 0
-            emit("level", value=round(float(np.sqrt(np.mean(np.square(frame)))), 4))
+            emit("level", value=round(rms, 4))
+
+        # --- Full duplex: sustained speech interrupts the tutor ------------
+        if tutor_speaking and not barge.fired:
+            if not barge.feed(is_speech, rms):
+                continue    # not an interruption (yet), so record nothing
+            print("\n[VAD] barge-in detected -> interrupting tutor")
+            interrupt_event.set()
+            drain_queue(speak_q)
+            drain_queue(audio_q)
+            emit("interrupted")
+            # Rewind into the audio that triggered this, so the interrupting
+            # words are transcribed instead of only whatever follows them.
+            speaking = True
+            silence = 0
+            buffer = list(preroll)
+            emit("state", state="hearing")
+            continue
+        if not tutor_speaking:
+            barge.reset()
 
         if is_speech:
             if not speaking:
                 print("\n[VAD] speech detected, listening ...")
                 emit("state", state="hearing")
                 speaking = True
-                # seed with pre-roll so the onset (first word) is not clipped
-                buffer = list(preroll)
+                # Seed with pre-roll so the onset (first word) is not clipped.
+                # Only the normal window: the rest of the deque exists for
+                # barge-in, and would prepend a second of room noise here.
+                buffer = list(preroll)[-preroll_len:]
             else:
                 buffer.append(frame)
             silence = 0
@@ -254,6 +355,161 @@ def is_hallucination(text: str) -> bool:
     return normalized in config.STT_HALLUCINATION_PHRASES
 
 
+class ThinkFilter:
+    """Strips reasoning blocks out of a streamed reply, token by token.
+
+    Qwen3 is a hybrid reasoning model: unless thinking is switched off it emits
+    `<think> ... </think>` before the answer. Spoken aloud that is a monologue of
+    working-out, and it would also be stored in the history and re-prefilled on
+    every turn. Thinking is disabled at the server (`--reasoning-budget 0`), so
+    this is the guard for the case where a model or server emits the tags anyway.
+
+    Tags are matched across token boundaries: a stream can deliver "<th", "ink>",
+    so any tail that could still become a tag is held back rather than spoken.
+    """
+
+    OPEN = "<think>"
+    CLOSE = "</think>"
+
+    def __init__(self):
+        self.buffer = ""
+        self.inside = False
+
+    @staticmethod
+    def _partial_tail(text: str, tag: str) -> int:
+        """Length of the longest suffix of `text` that is a prefix of `tag`."""
+        for k in range(min(len(tag) - 1, len(text)), 0, -1):
+            if text.endswith(tag[:k]):
+                return k
+        return 0
+
+    def feed(self, token: str) -> str:
+        """Add `token`; return the text that is safe to speak now."""
+        self.buffer += token
+        out = []
+        while True:
+            if self.inside:
+                end = self.buffer.find(self.CLOSE)
+                if end >= 0:
+                    self.buffer = self.buffer[end + len(self.CLOSE):]
+                    self.inside = False
+                    continue
+                keep = self._partial_tail(self.buffer, self.CLOSE)
+                self.buffer = self.buffer[len(self.buffer) - keep:] if keep else ""
+                break
+            start = self.buffer.find(self.OPEN)
+            if start >= 0:
+                out.append(self.buffer[:start])
+                self.buffer = self.buffer[start + len(self.OPEN):]
+                self.inside = True
+                continue
+            keep = self._partial_tail(self.buffer, self.OPEN)
+            split = len(self.buffer) - keep
+            out.append(self.buffer[:split])
+            self.buffer = self.buffer[split:]
+            break
+        return "".join(out)
+
+    def flush(self) -> str:
+        """End of stream: release a held-back tail that never became a tag."""
+        if self.inside:      # unterminated thinking: nothing in it was for speech
+            self.buffer = ""
+            return ""
+        tail, self.buffer = self.buffer, ""
+        return tail
+
+
+class CueFilter:
+    """Pulls "[excited]" mood cues out of a streamed reply, token by token.
+
+    The tutor is asked to prefix a reply with the mood it is speaking in, which
+    is what drives rate, pitch, loudness and how wide the avatar articulates
+    (see src/emotion.py). The cue is an instruction to the voice, not something
+    to say, so it must never reach TTS, the transcript or the history -- and
+    like `<think>`, it can arrive split across tokens ("[ex", "cited]").
+
+    Anything bracketed that is *not* a known mood is left alone: "(the bill)" is
+    part of what the tutor meant to say.
+    """
+
+    MAX_CUE = 24   # longer than any mood word: past this it is not a cue
+
+    # A bracketed word or two, letters only. The prompt allows nothing else in
+    # square brackets, and models invent their own cues anyway ("[natural]",
+    # "[soft voice]"), so anything cue-shaped is dropped: an unknown one leaves
+    # the mood to the sentence's own signals, which is far better than the
+    # speaker saying the word "natural".
+    CUE_SHAPED = re.compile(r"^[A-Za-z][A-Za-z \-]{1,18}$")
+
+    def __init__(self):
+        self.buffer = ""            # held-back text, always starting at '['
+        self.emotion: str | None = None   # most recent cue seen
+        self._fresh = False         # that cue has not been used by a sentence yet
+        self._eat_space = False     # drop the space a cue left behind
+
+    def take(self) -> "str | None":
+        """The cue for the sentence just finished, or None if there was no new one.
+
+        Consuming it matters: the model is asked for a cue only when the mood
+        changes, so a cue that stayed set would freeze the rest of the reply into
+        the mood of its first sentence. Later sentences fall back to their own
+        signals instead -- which is how "[warm] Say la cuenta. Want to try it?"
+        ends up warm and then curious.
+        """
+        if not self._fresh:
+            return None
+        self._fresh = False
+        return self.emotion
+
+    def _visible(self, text: str) -> str:
+        """Text to pass on, with any whitespace a cue left in front of it gone."""
+        if not self._eat_space:
+            return text
+        stripped = text.lstrip()
+        if stripped:
+            self._eat_space = False
+        return stripped
+
+    def feed(self, text: str) -> str:
+        """Add `text`; return the part that is safe to speak and show now."""
+        self.buffer += text
+        out = []
+        while self.buffer:
+            if not self.buffer.startswith("["):
+                head, bracket, rest = self.buffer.partition("[")
+                out.append(self._visible(head))
+                self.buffer = "[" + rest if bracket else ""
+                continue
+            end = self.buffer.find("]")
+            if end < 0:
+                if len(self.buffer) > self.MAX_CUE or "\n" in self.buffer:
+                    out.append(self._visible(self.buffer[0]))   # not a cue after all
+                    self.buffer = self.buffer[1:]
+                    continue
+                break                                # wait for the rest of it
+            inner = self.buffer[1:end]
+            name = emotion.canonical(inner)
+            if name:
+                self.emotion = name
+                self._fresh = True
+                self._eat_space = True
+            elif self.CUE_SHAPED.match(inner):
+                self._eat_space = True       # a cue we do not know: drop it silently
+            else:
+                out.append(self._visible(self.buffer[:end + 1]))
+            self.buffer = self.buffer[end + 1:]
+        return "".join(out)
+
+    def flush(self) -> str:
+        """End of stream: release whatever was held back and is not a cue."""
+        tail, self.buffer = self.buffer, ""
+        if tail.startswith("[") and emotion.canonical(tail[1:]):
+            self.emotion = emotion.canonical(tail[1:])
+            self._fresh = True
+            return ""
+        return self._visible(tail)
+
+
 def next_sentence(buffer: str):
     """Split the first complete sentence off `buffer`.
 
@@ -267,8 +523,11 @@ def next_sentence(buffer: str):
     return buffer[: m.end()].strip(), buffer[m.end():]
 
 
-def transcribe(audio: np.ndarray) -> str:
+def transcribe(audio: np.ndarray) -> tuple[str, str]:
     """Transcribe an utterance, guarding against Whisper hallucinations.
+
+    Returns (text, language) where language is a Whisper language code like
+    'en', 'es', 'zh'. Falls back to config.DEFAULT_LANGUAGE on failure.
 
     Whisper fabricates stock phrases ("Thank you", "Thanks for watching") when
     given near-silence or noise. We defend in three layers: an energy gate, the
@@ -280,7 +539,7 @@ def transcribe(audio: np.ndarray) -> str:
     rms = utterance_rms(audio)
     if rms < config.STT_MIN_RMS:
         print(f"[STT] skipped near-silence (rms={rms:.4f})")
-        return ""
+        return "", config.DEFAULT_LANGUAGE
 
     # Robust decoding: greedy, no cross-segment priming (a hallucination amplifier).
     result = mlx_whisper.transcribe(
@@ -293,40 +552,90 @@ def transcribe(audio: np.ndarray) -> str:
         compression_ratio_threshold=2.4,
     )
 
+    # Extract detected language (multilingual Whisper returns this).
+    detected_lang = result.get("language", config.DEFAULT_LANGUAGE)
+    # Normalize: Whisper may return full name or code depending on version.
+    if detected_lang and len(detected_lang) > 3:
+        # e.g. "english" -> "en", "spanish" -> "es", "chinese" -> "zh"
+        _LANG_NAMES = {"english": "en", "spanish": "es", "chinese": "zh",
+                       "mandarin": "zh"}
+        detected_lang = _LANG_NAMES.get(detected_lang.lower(), detected_lang[:2])
+    # Only support configured languages; fall back for unsupported ones.
+    if detected_lang not in config.LANGUAGE_MAP:
+        detected_lang = config.DEFAULT_LANGUAGE
+
     # Layer 2: trust Whisper's own scores, but only to reject a WHOLE utterance
     # that is entirely non-speech (see has_real_speech).
     if not has_real_speech(result.get("segments")):
         print("[STT] rejected: entire utterance flagged non-speech/low-confidence")
-        return ""
+        return "", detected_lang
     text = result.get("text", "").strip()
 
     # Layer 3: blocklist of known hallucinated fillers.
     if is_hallucination(text):
         print(f"[STT] rejected hallucination: {text!r}")
-        return ""
+        return "", detected_lang
 
-    return text
+    return text, detected_lang
 
 
-def stream_llm(prompt: str):
-    """Stream the LLM reply, yielding complete sentences for TTS."""
+def stream_llm(prompt: str, lang: str = config.DEFAULT_LANGUAGE):
+    """Stream the LLM reply, yielding (sentence, emotion) pairs for TTS.
+
+    `emotion` is the mood cue the model wrote most recently, or None when it
+    wrote none -- in which case the mood is read off the sentence itself.
+
+    When the detected language differs from the previous turn, a brief hint is
+    added so the model switches language even when the history is predominantly
+    in a different one. It is folded into the system prompt of *this request*
+    rather than appended to the conversation: Qwen3's chat template raises
+    "System message must be at the beginning" for a system message that follows a
+    user turn, which Ollama returns as HTTP 500 rather than as a stream. Keeping
+    it out of `conversation` also means there is nothing to roll back.
+    """
+    global _last_llm_lang
     conversation.append({"role": "user", "content": prompt})
-    payload = {
-        "messages": conversation,
-        "stream": True,
-        "temperature": config.LLM_TEMPERATURE,
-        "max_tokens": config.LLM_MAX_TOKENS,
-    }
+
+    messages = list(conversation)
+    if lang != _last_llm_lang and messages and messages[0]["role"] == "system":
+        lang_names = {"en": "English", "es": "Spanish", "zh": "Chinese"}
+        lang_name = lang_names.get(lang, lang)
+        messages[0] = dict(messages[0])
+        messages[0]["content"] += (
+            f"\n\nThe student is now speaking {lang_name}. "
+            f"Reply in {lang_name} from now on.")
+    _last_llm_lang = lang
+
+    payload = config.llm_payload(messages, stream=True)
     sentence = ""
     full_reply = ""
+    think = ThinkFilter()
+    cues = CueFilter()
     print(f"[{config.persona_name(active_persona)}]: ", end="", flush=True)
     try:
         resp = requests.post(config.LLAMA_SERVER_URL, json=payload, stream=True, timeout=120)
     except requests.RequestException as e:
-        print(f"\n[LLM] cannot reach llama-server: {e}")
+        print(f"\n[LLM] cannot reach {config.LLM_BACKEND}: {e}")
         emit("error", text="Cannot reach the language model server. "
-                           "Start it with ./scripts/start_server.sh")
-        conversation.pop()  # roll back the user turn
+                           f"{config.LLM_START_HINT}")
+        conversation.pop()          # roll back the user turn
+        return
+
+    if resp.status_code != 200:
+        # Ollama answers a refused request with a JSON body, not a stream:
+        # {"error": {"message": "model requires more system memory ...
+        detail = ""
+        try:
+            body = resp.json()
+            detail = body.get("error", body) if isinstance(body, dict) else body
+            if isinstance(detail, dict):
+                detail = detail.get("message", detail)
+        except ValueError:
+            detail = resp.text[:200]
+        print(f"\n[LLM] {config.LLM_BACKEND} returned HTTP {resp.status_code}: {detail}")
+        emit("error", text=f"The language model refused the request: {detail}")
+        resp.close()
+        conversation.pop()          # roll back the user turn
         return
 
     for line in resp.iter_lines():
@@ -342,7 +651,23 @@ def stream_llm(prompt: str):
             data = json.loads(decoded)
         except json.JSONDecodeError:
             continue
-        token = data["choices"][0]["delta"].get("content", "")
+        # A chunk is not guaranteed to carry text: the backend can report an
+        # error mid-stream instead (a runner that died, or a model it cannot
+        # load), and a closing chunk usually carries none. Reading the token
+        # path blind used to end the brain thread on a KeyError, which left the
+        # session listening but unable to answer.
+        error = data.get("error")
+        if error:
+            message = error.get("message", error) if isinstance(error, dict) else error
+            print(f"\n[LLM] {config.LLM_BACKEND} error mid-reply: {message}")
+            emit("error", text=f"The language model stopped: {message}")
+            break
+        token, finished = config.llm_chunk(data)
+        if not token:
+            if finished:
+                break
+            continue
+        token = cues.feed(think.feed(token))
         if not token:
             continue
         print(token, end="", flush=True)
@@ -351,10 +676,17 @@ def stream_llm(prompt: str):
         full_reply += token
         complete, sentence = next_sentence(sentence)
         if complete:
-            yield complete
+            yield complete, cues.take()
+    tail = cues.feed(think.flush()) + cues.flush()
+    if tail:
+        print(tail, end="", flush=True)
+        emit("assistant_delta", text=tail)
+        sentence += tail
+        full_reply += tail
     print()
     if sentence.strip() and not interrupt_event.is_set():
-        yield sentence.strip()
+        yield sentence.strip(), cues.take()
+
     if full_reply.strip():
         conversation.append({"role": "assistant", "content": full_reply.strip()})
     emit("assistant_done")
@@ -378,6 +710,12 @@ def trim_history():
 
 
 def brain_worker(gen: int):
+    """Transcribe each utterance and stream a reply into the synthesis queue.
+
+    One turn failing must not end the session: an unexpected error here used to
+    kill the thread, leaving a session that still listened, still showed "ready",
+    and could never answer again.
+    """
     while session_active(gen):
         try:
             audio = utterance_q.get(timeout=0.2)
@@ -385,20 +723,26 @@ def brain_worker(gen: int):
             continue
 
         interrupt_event.clear()
-        text = transcribe(audio)
-        # Transcription takes a second or two, in which the user may have
-        # pressed Stop or switched session; do not start a reply into the void.
-        if not session_active(gen):
-            return
-        if not text:
+        try:
+            text, detected_lang = transcribe(audio)
+            # Transcription takes a second or two, in which the user may have
+            # pressed Stop or switched session; do not start a reply into the void.
+            if not session_active(gen):
+                return
+            if not text:
+                emit("state", state="listening")
+                continue
+            print(f"\n[You ({detected_lang})]: {text}")
+            emit("user", text=text)
+            for sentence, mood in stream_llm(text, lang=detected_lang):
+                if interrupt_event.is_set() or not session_active(gen):
+                    break
+                speak_q.put((sentence, detected_lang, mood))
+        except Exception as e:
+            traceback.print_exc()
+            emit("error", text=f"That turn failed ({type(e).__name__}: {e}). "
+                               "Still listening -- try again.")
             emit("state", state="listening")
-            continue
-        print(f"\n[You]: {text}")
-        emit("user", text=text)
-        for sentence in stream_llm(text):
-            if interrupt_event.is_set() or not session_active(gen):
-                break
-            speak_q.put(sentence)
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +752,128 @@ def drain_queue(q: queue.Queue):
     """Discard everything currently queued (used on barge-in)."""
     with q.mutex:
         q.queue.clear()
+
+
+def refresh_audio_devices():
+    """Re-read CoreAudio's device list.
+
+    PortAudio enumerates devices once, when sounddevice initializes it at import
+    time. If the default device changes after that -- headphones plugged in, a
+    Teams call taking the device over, a display with speakers waking up -- the
+    cached index is stale and starting a stream on it fails with
+    ``||PaMacCore (AUHAL)|| Unspecified Audio Hardware Error`` and
+    ``PaErrorCode -9986``. Re-initializing rebuilds the list.
+
+    Only safe while no stream is open (terminating PortAudio invalidates them),
+    so this runs at the top of start_pipeline, before the mic is opened.
+    """
+    try:
+        sd._terminate()
+        sd._initialize()
+    except Exception as e:  # never block a session on this
+        print(f"[audio] could not refresh the device list: {e}")
+
+
+def memory_pressure_hint() -> str | None:
+    """Explain a stream failure caused by memory rather than by the device.
+
+    CoreAudio wires (``mlock``) a 64 KB shared buffer per stream, and the kernel
+    refuses when there is no wirable memory left:
+
+        HALB_SharedBuffer::Lock: mlock failed: byte size 65536, errno 35
+        StartIOThread: the IO thread failed to start, Error: 2003329396
+
+    2003329396 is `'what'`, kAudioHardwareUnspecifiedError, which PortAudio
+    reports as the same `-9986` a missing device gives. Loading a large model is
+    exactly when this happens: measured here, warming a 25 GB LLM at a 131072
+    context took the machine to 3 % free with 32.1 GB of 36 GB wired, and every
+    mic open failed for the two minutes that lasted while the device itself was
+    healthy.
+
+    `memory_pressure` is what gets asked, not vm_stat's "Pages free": macOS runs
+    with free pages near zero by design, so that number says nothing about
+    whether an allocation will succeed. Returns None when memory is not the
+    likely cause, so the caller can fall back to talking about devices.
+    """
+    try:
+        out = subprocess.run(["memory_pressure", "-Q"], capture_output=True,
+                             text=True, timeout=2).stdout
+        free_pct = int(re.search(r"free percentage:\s*(\d+)", out).group(1))
+        total = int(re.search(r"system has (\d+)", out).group(1))
+    except Exception:
+        return None
+    if free_pct >= 10:
+        return None
+    wired = ""
+    try:
+        vm = subprocess.run(["vm_stat"], capture_output=True, text=True,
+                            timeout=2).stdout
+        page_size = int(re.search(r"page size of (\d+)", vm).group(1))
+        pages = int(re.search(r"Pages wired down:\s*(\d+)", vm).group(1))
+        wired = f", {pages * page_size / 2**30:.1f} GB of it wired"
+    except Exception:
+        pass
+    return (f"the machine is out of memory to lock ({free_pct}% of "
+            f"{total / 2**30:.0f} GB free{wired}), so CoreAudio cannot wire the "
+            f"buffer a stream needs. This is what loading a large model does: "
+            f"give it a minute, or cut the LLM's footprint with "
+            f"VT_LLM_CONTEXT=4096 or a smaller VT_LLM_MODEL")
+
+
+def open_stream_with_retries(factory, what: str, backoff=None):
+    """Open and start a stream, riding out CoreAudio's transient refusals.
+
+    Starting a stream on macOS fails with ``Unspecified Audio Hardware Error``
+    (`PaErrorCode -9986`) not only when the device is gone but also while the
+    audio system is briefly unable to hand it out -- measured here as 30
+    consecutive failures over 9 s on a mic that `ffmpeg -f avfoundation` could
+    record from in the same minute, and which then worked 9 times out of 9. One
+    attempt therefore says very little, which is why `backoff` gives a whole
+    sequence of them. A fresh stream is built per attempt: PortAudio does not
+    promise a stream whose start() failed is reusable.
+
+    Returns the started stream, or None if it never opened.
+    """
+    if backoff is None:
+        backoff = config.AUDIO_OPEN_BACKOFF
+    last: Exception | None = None
+    for attempt, delay in enumerate(backoff):
+        stream = None
+        try:
+            stream = factory()
+            stream.start()
+            if attempt:
+                print(f"[audio] {what} opened on attempt {attempt + 1}")
+            return stream
+        except sd.PortAudioError as e:
+            last = e
+            if stream is not None:
+                stream.close(ignore_errors=True)
+            if attempt == 0:
+                print(f"[audio] {what} busy, retrying for "
+                      f"~{sum(backoff):.0f}s...")
+            time.sleep(delay)
+    print(f"[audio] {what} did not open after {len(backoff)} attempts ({last})")
+    hint = memory_pressure_hint()
+    if hint:
+        print(f"[audio] {hint}")
+    return None
+
+
+def open_output_stream(sample_rate: int, backoff=None) -> sd.OutputStream | None:
+    """Open the speaker. Returns None so a session survives a dead output device.
+
+    Waits far less than the mic does: a sentence held up here is a sentence
+    spoken late, and the next one will try again anyway.
+    """
+    out = open_stream_with_retries(
+        lambda: sd.OutputStream(samplerate=sample_rate, channels=1, dtype="float32"),
+        "output device",
+        config.AUDIO_OPEN_BACKOFF_OUTPUT if backoff is None else backoff)
+    if out is None:
+        print("[audio] nothing will be spoken until the output device comes back. "
+              "Check System Settings > Sound.")
+    return out
 
 
 def play_interruptible(out: sd.OutputStream, audio: np.ndarray):
@@ -437,23 +903,26 @@ def synth_worker(tts: KokoroTTS, gen: int):
     far sooner than it takes to speak the previous one and the inter-sentence
     gap disappears entirely.
 
-    Each item is (audio, viseme_timeline); the timeline comes from the same
-    forward pass as the audio, so lip-sync costs nothing extra.
+    Each item is (audio, viseme_timeline, prosody); the timeline comes from the
+    same forward pass as the audio, so lip-sync costs nothing extra, and the
+    prosody tells the UI which mood the sentence was spoken in.
     """
     while session_active(gen):
         try:
-            text = speak_q.get(timeout=0.2)
+            item = speak_q.get(timeout=0.2)
         except queue.Empty:
             continue
         if interrupt_event.is_set():
             continue
+        # Unpack (sentence, language, mood cue or None)
+        text, lang, mood = item
         # synth_busy stays set until the audio is queued, so the player never
         # sees "both queues empty" while a sentence is still being produced.
         synth_busy.set()
         try:
-            audio, timeline = tts.synthesize_with_visemes(text)
-            if audio.size and not interrupt_event.is_set():
-                audio_q.put((audio, timeline))
+            speech = tts.speak(text, lang=lang, persona=active_persona, emotion=mood)
+            if speech.audio.size and not interrupt_event.is_set():
+                audio_q.put((speech.audio, speech.timeline, speech.prosody))
         except Exception as e:
             print(f"\n[TTS] synthesis error: {e}")
         finally:
@@ -472,9 +941,13 @@ def speak_worker(tts: KokoroTTS, gen: int):
     ~190 ms that closing a stream spends draining its buffer (constructing a
     stream is only ~10 ms; the drain was the real cost), measured as 690 ms vs
     500 ms of wall time to play 500 ms of audio.
+
+    The stream is opened on the first sentence rather than at startup, and a
+    device error closes it instead of ending the thread: the session keeps
+    listening and the next sentence tries to open the device again. Playback
+    used to die permanently if the device was busy at that one moment.
     """
-    out = sd.OutputStream(samplerate=tts.sample_rate, channels=1, dtype="float32")
-    out.start()
+    out: sd.OutputStream | None = None
     # Monotonic time at which the audio already handed to PortAudio finishes.
     # Used to predict when the next sentence will actually be *heard*, so the
     # browser can start the mouth animation at the right moment.
@@ -482,11 +955,23 @@ def speak_worker(tts: KokoroTTS, gen: int):
     try:
         while session_active(gen):
             try:
-                audio, timeline = audio_q.get(timeout=0.2)
+                audio, timeline, prosody = audio_q.get(timeout=0.2)
             except queue.Empty:
                 continue
             if interrupt_event.is_set():
                 continue
+
+            if out is None:
+                out = open_output_stream(tts.sample_rate)
+                playhead = 0.0
+                if out is None:
+                    # Nothing can be spoken: drop what is queued and go back to
+                    # listening rather than piling sentences up behind a dead
+                    # device.
+                    drain_queue(audio_q)
+                    assistant_speaking.clear()
+                    emit("state", state="listening")
+                    continue
 
             assistant_speaking.set()
             emit("state", state="speaking")
@@ -497,12 +982,30 @@ def speak_worker(tts: KokoroTTS, gen: int):
             now = time.monotonic()
             starts_at = max(now + out.latency, playhead)
             if timeline:
+                # `pace` lets the browser match its mouth transition times to
+                # how fast this sentence is actually spoken; `emotion` only
+                # colours the avatar. Per-span articulation is in the timeline.
                 emit("visemes",
                      start_in_ms=int(round((starts_at - now) * 1000)),
-                     timeline=visemes.to_wire(timeline))
+                     timeline=visemes.to_wire(timeline),
+                     emotion=prosody.emotion,
+                     pace=round(prosody.speed, 3))
             playhead = starts_at + audio.size / tts.sample_rate
 
-            play_interruptible(out, audio)
+            try:
+                play_interruptible(out, audio)
+            except sd.PortAudioError as e:
+                # The device went away mid-sentence (unplugged, taken over).
+                # Discard the stream; the next sentence reopens on whatever the
+                # default device is by then.
+                print(f"\n[audio] playback device error: {e}")
+                out.close(ignore_errors=True)
+                out = None
+                playhead = 0.0
+                drain_queue(audio_q)
+                assistant_speaking.clear()
+                emit("state", state="listening")
+                continue
 
             if interrupt_event.is_set():
                 # Barge-in: drop queued audio and cut playback immediately.
@@ -512,7 +1015,9 @@ def speak_worker(tts: KokoroTTS, gen: int):
                 out.abort()
                 playhead = 0.0  # buffer discarded, nothing is queued to be heard
                 assistant_speaking.clear()
-                emit("state", state="listening")
+                # "hearing", not "listening": playback stopped because the user
+                # is mid-sentence, and the VAD is already recording them.
+                emit("state", state="hearing")
                 continue
 
             # Only release the mic once nothing else is coming AND the audio
@@ -525,7 +1030,8 @@ def speak_worker(tts: KokoroTTS, gen: int):
                     assistant_speaking.clear()
                     emit("state", state="listening")
     finally:
-        out.close(ignore_errors=True)
+        if out is not None:
+            out.close(ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -615,9 +1121,14 @@ def start_pipeline(persona_key: str = config.DEFAULT_PERSONA, reset_history: boo
 
         set_persona(persona_key)
         if reset_history:
+            global _last_llm_lang
             del conversation[1:]
+            _last_llm_lang = config.DEFAULT_LANGUAGE
 
         tts = load_tts()
+        # Before any stream is opened, so a device that changed since import is
+        # seen. Mid-session this is not safe -- it would invalidate the mic.
+        refresh_audio_devices()
         _threads = [
             threading.Thread(target=vad_worker, args=(gen,), name="vad", daemon=True),
             threading.Thread(target=brain_worker, args=(gen,), name="brain", daemon=True),
@@ -627,11 +1138,28 @@ def start_pipeline(persona_key: str = config.DEFAULT_PERSONA, reset_history: boo
         for t in _threads:
             t.start()
 
-        _input_stream = sd.InputStream(
-            samplerate=config.SAMPLE_RATE, channels=config.CHANNELS,
-            dtype="float32", blocksize=config.FRAME_SIZE, callback=audio_callback,
-        )
-        _input_stream.start()
+        _input_stream = open_stream_with_retries(
+            lambda: sd.InputStream(
+                samplerate=config.SAMPLE_RATE, channels=config.CHANNELS,
+                dtype="float32", blocksize=config.FRAME_SIZE, callback=audio_callback),
+            "microphone")
+        if _input_stream is None:
+            # Without a mic there is no session; unwind the workers we just
+            # started instead of leaving them running deaf, and clear _threads
+            # so a retry is not mistaken for "already running".
+            stop_event.set()
+            for t in _threads:
+                t.join(timeout=1.0)
+            _threads = []
+            emit("state", state="idle")
+            hint = memory_pressure_hint()
+            raise RuntimeError(
+                "could not open the microphone: " + (hint or
+                    "the audio system refused it for "
+                    f"~{sum(config.AUDIO_OPEN_BACKOFF):.0f}s. This is usually "
+                    "temporary -- press Start again. If it keeps happening, check "
+                    "the input device in System Settings > Sound")
+            )
         emit("state", state="listening")
 
 
@@ -693,6 +1221,3 @@ def main():
 if __name__ == "__main__":
     main()
 
-
-if __name__ == "__main__":
-    main()

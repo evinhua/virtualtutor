@@ -6,10 +6,14 @@ keeps its offline, no-extra-dependency property.
 
   GET  /                -> the UI
   GET  /api/personas    -> available tutor personas
+  GET  /api/config      -> voices per language + duplex mode
   GET  /api/status      -> whether the pipeline is running, and which persona
   GET  /api/events      -> SSE stream of pipeline events
   POST /api/start       -> start listening   (body: {"persona": "tutor"})
   POST /api/persona     -> switch persona    (body: {"persona": "jester"})
+  POST /api/config      -> set voices / duplex mode, mid-session included
+                           (body: {"voices": {"en": "af_bella"},
+                                   "duplex": "half" | "full"})
   POST /api/stop        -> stop listening
 
 Audio stays on this machine: the microphone and speakers are driven by the
@@ -72,6 +76,26 @@ class Broker:
 
 
 broker = Broker()
+
+
+def config_payload() -> dict:
+    """Everything the Configuration dialog needs, in one round trip.
+
+    The lists come straight from config.py so it stays the single source of
+    truth for what the UI may offer.
+    """
+    return {
+        "languages": [
+            {
+                "code": lang,
+                "label": config.LANGUAGE_LABELS.get(lang, lang),
+                "voice": entry["voice"],
+                "voices": list(config.AVAILABLE_VOICES.get(lang, ())),
+            }
+            for lang, entry in config.LANGUAGE_MAP.items()
+        ],
+        "duplex": config.duplex_mode(),
+    }
 
 
 def pump_events():
@@ -154,6 +178,8 @@ class Handler(BaseHTTPRequestHandler):
                     for k, v in config.PERSONAS.items()
                 ],
             })
+        elif route == "/api/config":
+            self._send_json(config_payload())
         elif route == "/api/status":
             self._send_json({
                 "running": voice_agent.is_running(),
@@ -195,6 +221,18 @@ class Handler(BaseHTTPRequestHandler):
                 str(body.get("persona", config.DEFAULT_PERSONA)))
             self._send_json({"ok": True, "persona": persona,
                              "persona_name": config.persona_name(persona)})
+        elif route == "/api/config":
+            # Voices and duplex mode are read per sentence / per mic frame, so
+            # both apply immediately -- no restart, no model reload.
+            voices = body.get("voices")
+            if isinstance(voices, dict):
+                for lang, voice in voices.items():
+                    voice_agent.set_voice(str(lang), str(voice))
+            if "duplex" in body:
+                voice_agent.set_duplex_mode(str(body["duplex"]).lower())
+            # Echo the resulting state so the UI shows what actually took
+            # effect rather than what it asked for.
+            self._send_json({"ok": True, **config_payload()})
         elif route == "/api/stop":
             try:
                 voice_agent.stop_pipeline()

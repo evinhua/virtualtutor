@@ -1,22 +1,23 @@
 #!/usr/bin/env bash
-# Start everything VirtualTutor needs: the llama.cpp LLM backend and the web
-# frontend. Ctrl+C stops both.
+# Start everything VirtualTutor needs: the LLM backend (Ollama by default) and
+# the web frontend. Ctrl+C stops both.
 #
 # The LLM's own log is noisy, so it goes to a file; the web server and the voice
 # pipeline (transcripts, state) stay in the foreground.
 #
-# Both services listen on 127.0.0.1 only and have NO authentication -- this is a
+# Both services listen on localhost only and have NO authentication -- this is a
 # local single-user setup. See README for details.
 #
 # Usage: ./scripts/start_all.sh
 set -uo pipefail
 cd "$(dirname "$0")/.."
+# shellcheck source=scripts/llm_env.sh
+. ./scripts/llm_env.sh
 
-LLM_PORT="${VT_PORT:-8080}"
 WEB_HOST="${VT_WEB_HOST:-127.0.0.1}"
 WEB_PORT="${VT_WEB_PORT:-8800}"
 LLM_LOG="${TMPDIR:-/tmp}/virtualtutor-llm.log"
-LLM_TIMEOUT="${VT_LLM_TIMEOUT:-180}"   # seconds to wait for model load
+LLM_TIMEOUT="${VT_LLM_TIMEOUT:-180}"   # seconds to wait for the backend
 
 llm_pid=""
 web_pid=""
@@ -48,9 +49,9 @@ cleanup() {
   printf '\nStopping VirtualTutor ...\n'
   stop_pid "$web_pid" "web frontend"
   if [ "$started_llm" -eq 1 ]; then
-    stop_pid "$llm_pid" "LLM server"
-  elif [ -n "$llm_pid" ]; then
-    printf '  leaving the LLM server running (it was already up before this script)\n'
+    stop_pid "$llm_pid" "LLM backend"
+  else
+    printf '  leaving the LLM backend running (it was up before this script)\n'
   fi
   wait 2>/dev/null
   printf 'All stopped.\n'
@@ -60,36 +61,60 @@ trap cleanup INT TERM
 trap cleanup EXIT
 
 # --- 1. LLM backend ---------------------------------------------------------
-if port_busy "$LLM_PORT"; then
-  echo "LLM server already running on port $LLM_PORT -- reusing it."
+if llm_ready; then
+  echo "LLM backend (${VT_LLM_BACKEND}) already serving on ${LLM_HOST} -- reusing it."
 else
-  echo "Starting LLM server on 127.0.0.1:$LLM_PORT (log: $LLM_LOG) ..."
-  ./scripts/start_server.sh > "$LLM_LOG" 2>&1 &
+  echo "Starting LLM backend (${VT_LLM_BACKEND}) on ${LLM_HOST} (log: $LLM_LOG) ..."
+  $LLM_START_SCRIPT > "$LLM_LOG" 2>&1 &
   llm_pid=$!
   started_llm=1
 
-  printf 'Loading model '
+  printf 'Waiting for it '
   ready=0
   for _ in $(seq 1 "$LLM_TIMEOUT"); do
-    if ! kill -0 "$llm_pid" 2>/dev/null; then
-      echo
-      echo "LLM server exited during startup. Last lines of $LLM_LOG:"
-      tail -15 "$LLM_LOG"
-      exit 1
-    fi
-    if curl -s "http://127.0.0.1:$LLM_PORT/health" 2>/dev/null | grep -q '"ok"'; then
+    if llm_ready; then
       ready=1
       break
+    fi
+    # start_server.sh exits 0 once an already-running Ollama has the model
+    # loaded, so a dead child is only a failure if the backend is not up.
+    if ! kill -0 "$llm_pid" 2>/dev/null; then
+      if llm_ready; then ready=1; break; fi
+      echo
+      echo "LLM backend exited during startup. Last lines of $LLM_LOG:"
+      tail -15 "$LLM_LOG"
+      exit 1
     fi
     printf '.'
     sleep 1
   done
   echo
   if [ "$ready" -ne 1 ]; then
-    echo "LLM server did not become ready within ${LLM_TIMEOUT}s. See $LLM_LOG"
+    echo "LLM backend did not become ready within ${LLM_TIMEOUT}s. See $LLM_LOG"
     exit 1
   fi
-  echo "LLM server ready."
+  echo "LLM backend ready."
+fi
+
+# Load the weights before the first question rather than during it, at the
+# context VT_LLM_CONTEXT asks for -- Ollama would otherwise size the KV cache
+# for the model's full trained length and leave the machine with no memory to
+# spare (see scripts/llm_env.sh).
+printf 'Loading %s at a %s-token context ' "$VT_LLM_MODEL" "$VT_LLM_CONTEXT"
+if llm_warm; then
+  echo "- loaded."
+else
+  echo
+  echo "Could not load '${VT_LLM_MODEL}'. Check \`ollama list\`, or run"
+  echo "./scripts/download_model.sh"
+  exit 1
+fi
+
+# start_server.sh returns once an already-running Ollama has the model loaded,
+# so a finished child here means we have nothing of our own to supervise or stop.
+if [ "$started_llm" -eq 1 ] && ! kill -0 "$llm_pid" 2>/dev/null; then
+  started_llm=0
+  llm_pid=""
 fi
 
 # --- 2. Web frontend --------------------------------------------------------
@@ -113,7 +138,7 @@ cat <<BANNER
   VirtualTutor is up.
 
     Open:  http://${WEB_HOST}:${WEB_PORT}
-    LLM :  127.0.0.1:${LLM_PORT}  (log: ${LLM_LOG})
+    LLM :  ${LLM_HOST}  (${VT_LLM_MODEL}, log: ${LLM_LOG})
 
   Local only, no authentication. Press Ctrl+C to stop everything.
 
